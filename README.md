@@ -211,37 +211,6 @@ The top-level `Makefile` wraps the core builds (`make`, `make platform=android N
 `.gitlab-ci.yml` builds the core with libretro's CI templates.
 `libretro/hypseushw_libretro.info` is the RetroArch core info file; copy it to RetroArch's `info` folder with the core.
 
-## Android app
-
-`net.daphnelr.player` is a thin launcher for HyperSpin and other frontends.
-It is distributed as an APK to sideload: it asks for *All files access*, which the Play Store restricts.
-It takes the game path in the `ROM` extra, the same as RetroArch:
-
-```
-am start -n net.daphnelr.player/.LaunchActivity --es ROM "<path>/framefile/lair.txt"
-```
-
-The first run asks for *All files access*, so the app can read the games folder.
-To exit a game, press Back, or hold Select and Start together.
-
-## Test tools
-
-The scripts in `tools/dev/` are developer harnesses (see `tools/dev/README.md`); they need MSYS2, `adb` and Python with Pillow and NumPy.
-
-| Tool | What it does |
-|---|---|
-| `host/lr_host.cpp` (`lr-host`) | A minimal frontend. It runs windowed, or with `--headless`, `--frames N`, `--dump DIR` and `--press F:BTN[:N]`. It gives the core OpenGL unless run with `--no-gl`; with `--headless --vulkan` it gives it Vulkan instead. |
-| `tools/dev/sweep-core.sh` | Headless run of every game on Windows (`DATA` = the Daphne folder). Writes contact sheets and audio levels. |
-| `tools/dev/sweep-singe.sh` | The same for the Singe games, in real time and from the games folder (`DATA`). |
-| `tools/dev/shield-sweep.sh` | The same sweep on an Android device over adb, reading the games from the device (`DATA` = the Daphne folder as the device sees it). `ENVV` sets environment variables and `EXTRA` adds harness arguments, for example `EXTRA="--opt daphne_cpu_fallback=enabled"`. |
-| `DAPHNE_LR_LOG=debug` | Environment variable that turns on engine debug logging. |
-| `DAPHNE_LR_PROFILE=1` | Environment variable that logs slow frames and, when a game is closed, where each frame's time went. |
-| `DAPHNE_LR_VERIFY_DUPES=1` | Environment variable that checks each frame reported as unchanged against a full recomposite (CPU renderer). |
-| `DAPHNE_LR_VERIFY_HWDEC=1` | Environment variable that decodes with libmpeg2 alongside the hardware decoder and compares every picture (Android). |
-| `tools/dev/hwseek` | Times frame-exact searches and playback with libmpeg2 and with MediaCodec on an Android device. `--compare` checks that both put out the same pictures. |
-| `tools/dev/compare-dumps.py` | Compares the frame dumps of two runs. Real-time runs aren't exactly repeatable, so expect some differences even between identical setups. |
-| `tools/dev/decoder-table.py` | Summarises two `shield-sweep.sh` runs side by side, for example hardware against software decoding. |
-| `DAPHNE_LR_VERIFY_GPU=1` | Environment variable that reads back every GPU-rendered frame (Vulkan or OpenGL) and compares it with the CPU renderer. It stalls the GPU, so ignore timings from such a run. |
 
 ## Licence
 
