@@ -609,6 +609,16 @@ union luai_Cast { double l_d; long l_l; };
 	{ if ((c)->status == 0) (c)->status = -1; }
 #define luai_jmpbuf	int  /* dummy variable */
 
+#elif defined(__LIBRETRO__) && defined(_WIN64) && defined(__GNUC__)
+/* The libretro core runs Lua on a libco stack.  MinGW-w64's longjmp unwinds
+** through SEH, which cannot walk that stack, so any Lua error (even one
+** pcall would catch) killed the process.  The builtins jump without
+** unwinding. */
+#define LUAI_THROW(L,c)	__builtin_longjmp((c)->b, 1)
+#define LUAI_TRY(L,c,a)	if (__builtin_setjmp((c)->b) == 0) { a }
+typedef void *luai_builtin_jmpbuf[5];
+#define luai_jmpbuf	luai_builtin_jmpbuf
+
 #elif defined(LUA_USE_ULONGJMP)
 /* in Unix, try _longjmp/_setjmp (more efficient) */
 #define LUAI_THROW(L,c)	_longjmp((c)->b, 1)

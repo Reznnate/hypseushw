@@ -42,12 +42,59 @@
 
 #include <mpeg2.h>
 
+#include "vldp_hwdec.h"
+#include "vldp_mp4.h"
+
+#ifdef VLDP_HWDEC
+#include <deque>
+#include <vector>
+static void hw_verify_report();
+#endif
+
 #ifdef VLDP_DEBUG
 #define FRAMELOG "frame_report.txt"
 #endif
 
+#ifdef __LIBRETRO__
+// Shared with the game thread and the frontend (see vldp.h).
+std::atomic<uint32_t> g_lr_vldp_wait_timer(LR_VLDP_NOT_WAITING);
+std::atomic<uint32_t> g_lr_vldp_next_due(0);
+std::atomic<int> g_lr_vldp_hwdec(0);
+std::atomic<int> g_lr_vldp_shown_pic(-1);
+std::atomic<int> g_lr_presented_pic(-1);
+
+// Search response, for the frontend's timing summary: real time until the
+// target frame was decoded, and game time until it was shown.  The VLDP
+// thread records; the frontend resets and reads.
+#define LR_SEARCH_SAMPLES 4096
+static float s_lr_search_ready_ms[LR_SEARCH_SAMPLES];
+static float s_lr_search_shown_ms[LR_SEARCH_SAMPLES];
+static std::atomic<unsigned> s_lr_search_count(0);
+static std::atomic<int> s_lr_search_state(0); // 1 waiting for the target, 2 for its display
+static uint64_t s_lr_search_t0_ns;
+static uint32_t s_lr_search_timer0;
+static float s_lr_search_ready;
+
+void vldp_lr_reset_search_stats() { s_lr_search_count = 0; s_lr_search_state = 0; }
+
+unsigned vldp_lr_search_stats(const float **ready_ms, const float **shown_ms)
+{
+    *ready_ms = s_lr_search_ready_ms;
+    *shown_ms = s_lr_search_shown_ms;
+    const unsigned n = s_lr_search_count;
+    return n < LR_SEARCH_SAMPLES ? n : LR_SEARCH_SAMPLES;
+}
+#endif
+
 // NOTICE : these variables should only be used by the private thread
 // !!!!!!!!!!!!
+
+#ifdef __LIBRETRO__
+// frame number of the picture draw_planes() is handling: pictures come in
+// display order, one frame each, from the picture decoding restarts at (the
+// I-frame before an MPEG-2 search target, an MP4 search's target itself)
+static int s_lr_pic = -1;
+#endif
 
 Uint8 s_old_req_cmdORcount = CMDORCOUNT_INITIAL; // the last value of the
                                                  // command byte we received
@@ -129,6 +176,9 @@ int idle_handler(void *surface)
 {
     int done = 0;
 
+#ifdef __LIBRETRO__
+    lr_register_cpu_thread(LR_THREAD_DECODER);
+#endif
     g_mpeg_data = mpeg2_init();
 
     // unless we are drawing video to the screen, we just sit here
@@ -202,6 +252,13 @@ int idle_handler(void *surface)
     */
 
     g_out_info.status = STAT_ERROR;
+#ifdef VLDP_HWDEC
+    hw_verify_report();
+    hwdec::close();
+#endif
+#ifdef VLDP_MP4
+    mp4::close();
+#endif
     mpeg2_close(g_mpeg_data);              // shutdown libmpeg2
 
     // de-allocate any files that have been precached
@@ -412,10 +469,163 @@ void ivldp_set_framerate(Uint8 frame_rate_code)
 }
 
 // decode_mpeg2 function taken from mpeg2dec.c and optimized a bit
+#ifdef __LIBRETRO__
+// set while ivldp_render() feeds the decoder from the video file
+static int s_in_render = 0;
+
+// For the platform decoders (hardware MPEG-2, MP4): non-zero when they
+// should stop putting out pictures because a command that ends this
+// playback is waiting (the ones ivldp_render() stops for), or draw_planes()
+// already skips everything for one.  They ask between pictures, and while
+// they have no room for input, so a stuck decoder cannot hold up a command.
+static int lr_decoder_abort()
+{
+    if (!s_in_render) return 0;
+    if (s_skip_all) return 1;
+    if (!ivldp_got_new_command()) return 0;
+    switch (g_req_cmdORcount & 0xF0) {
+    case VLDP_REQ_QUIT:
+    case VLDP_REQ_OPEN:
+    case VLDP_REQ_SEARCH:
+    case VLDP_REQ_STOP:
+    case VLDP_REQ_SKIP:
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+#ifdef VLDP_MP4
+static void idle_handler_open_mp4(const char *req_file);
+#endif
+
+#ifdef VLDP_HWDEC
+// DAPHNE_LR_VERIFY_HWDEC=1: libmpeg2 decodes the same stream alongside the
+// hardware decoder, and each picture the hardware path puts out is checked
+// against libmpeg2's picture in the same place (development aid).
+static int s_hw_verify = -1;
+static std::deque<std::vector<uint8_t>> s_sw_sigs;
+static unsigned long s_hw_checked, s_hw_differ, s_hw_unmatched;
+
+// coarse luma signature: mean of a 16x9 grid of blocks
+static std::vector<uint8_t> luma_signature(const uint8_t *y, int pitch, int w, int h)
+{
+    std::vector<uint8_t> s(16 * 9);
+    for (int by = 0; by < 9; ++by)
+        for (int bx = 0; bx < 16; ++bx) {
+            unsigned long sum = 0, n = 0;
+            for (int yy = by * h / 9; yy < (by + 1) * h / 9; yy += 2)
+                for (int xx = bx * w / 16; xx < (bx + 1) * w / 16; xx += 2, ++n)
+                    sum += y[(size_t)yy * pitch + xx];
+            s[by * 16 + bx] = (uint8_t)(n ? sum / n : 0);
+        }
+    return s;
+}
+
+static int hw_verifying()
+{
+    if (s_hw_verify < 0) s_hw_verify = getenv("DAPHNE_LR_VERIFY_HWDEC") != NULL;
+    return s_hw_verify;
+}
+
+// libmpeg2's side of the check: decode, keep signatures, show nothing
+static void verify_feed_libmpeg2(uint8_t *current, uint8_t *end)
+{
+    const mpeg2_info_t *info = mpeg2_info(g_mpeg_data);
+    mpeg2_buffer(g_mpeg_data, current, end);
+    for (;;) {
+        mpeg2_state_t state = mpeg2_parse(g_mpeg_data);
+        if (state == STATE_BUFFER) break;
+        if ((state == STATE_SLICE || state == STATE_END || state == STATE_INVALID_END) && info->display_fbuf)
+            s_sw_sigs.push_back(luma_signature(info->display_fbuf->buf[0], info->sequence->width,
+                                               info->sequence->picture_width, info->sequence->picture_height));
+    }
+}
+
+static void hw_draw(const vldp_picture &pic)
+{
+    const uint8_t *y = pic.y;
+    const int ypitch = pic.ypitch, placeholder = pic.placeholder;
+    if (hw_verifying()) {
+        if (s_sw_sigs.empty())
+            ++s_hw_unmatched;
+        else {
+            if (!placeholder) {
+                const std::vector<uint8_t> hw = luma_signature(y, ypitch, (int)g_out_info.w, (int)g_out_info.h);
+                const std::vector<uint8_t> &sw = s_sw_sigs.front();
+                unsigned long d = 0;
+                for (size_t i = 0; i < hw.size(); ++i) d += (unsigned long)abs((int)hw[i] - (int)sw[i]);
+                ++s_hw_checked;
+                if (d > 3 * hw.size() && s_hw_differ++ < 20) {
+                    LOGW << fmt("VLDP hardware decoder check: picture at frame %u differs from libmpeg2's "
+                                "(mean %.1f)", g_out_info.current_frame, (double)d / hw.size());
+                }
+            }
+            s_sw_sigs.pop_front();
+        }
+    }
+    draw_planes(pic);
+}
+
+// DAPHNE_LR_VERIFY_HWDEC result so far (for the frontend's summary)
+int vldp_lr_hwdec_check(unsigned long *checked, unsigned long *differ, unsigned long *unmatched)
+{
+    *checked = s_hw_checked;
+    *differ = s_hw_differ;
+    *unmatched = s_hw_unmatched;
+    return hw_verifying();
+}
+
+// Logs the check's result for the file played, and starts counting afresh.
+static void hw_verify_report()
+{
+    if (hw_verifying() && (s_hw_checked || s_hw_unmatched)) {
+        LOGI << fmt("VLDP hardware decoder check: %lu pictures compared with libmpeg2, %lu differed, "
+                    "%lu had no libmpeg2 picture", s_hw_checked, s_hw_differ, s_hw_unmatched);
+    }
+    s_hw_checked = s_hw_differ = s_hw_unmatched = 0;
+    s_sw_sigs.clear();
+}
+
+// The hardware decoder gave up (and logged why): libmpeg2 decodes from the
+// next picture it can, starting with the cached sequence header.
+static void hw_fallback()
+{
+    mpeg2_reset(g_mpeg_data, 1);
+    s_sw_sigs.clear();
+    vldp_process_sequence_header();
+}
+#endif
+
+// Resets whichever decoder the open file uses.
+static void decoder_reset(int full)
+{
+#ifdef VLDP_HWDEC
+    if (hwdec::active()) {
+        hwdec::reset();
+        if (hw_verifying()) {
+            mpeg2_reset(g_mpeg_data, full);
+            s_sw_sigs.clear();
+        }
+        return;
+    }
+#endif
+    mpeg2_reset(g_mpeg_data, full);
+}
+
 static void decode_mpeg2(uint8_t *current, uint8_t *end)
 {
     const mpeg2_info_t *info;
     mpeg2_state_t state;
+
+#ifdef VLDP_HWDEC
+    if (hwdec::active()) {
+        if (hw_verifying()) verify_feed_libmpeg2(current, end);
+        hwdec::decode(current, end);
+        if (!hwdec::active()) hw_fallback();
+        return;
+    }
+#endif
 
     mpeg2_buffer(g_mpeg_data, current, end);
     info = mpeg2_info(g_mpeg_data);
@@ -436,6 +646,12 @@ static void decode_mpeg2(uint8_t *current, uint8_t *end)
             if (info->display_fbuf) {
                 draw_frame(info);
             }
+#ifdef __LIBRETRO__
+            // A search/skip/open/stop/quit arrived: the rest of this buffer
+            // would only be decoded to be thrown away (the handlers reset
+            // libmpeg2), while the game thread waits for our acknowledgement.
+            if (s_in_render && s_skip_all) return;
+#endif
             break;
         default:
             break;
@@ -483,6 +699,13 @@ void vldp_cache_sequence_header()
 // In other words, this is ONLY used when we are seeking to an arbitrary frame
 void vldp_process_sequence_header()
 {
+#ifdef VLDP_HWDEC
+    // the hardware decoder gets it again with the next picture after a reset
+    if (hwdec::active()) {
+        if (hw_verifying()) verify_feed_libmpeg2(g_header_buf, g_header_buf + g_header_buf_size);
+        return;
+    }
+#endif
     // decode the pre-cached sequence header
     decode_mpeg2(g_header_buf, g_header_buf + g_header_buf_size);
 }
@@ -507,8 +730,23 @@ void idle_handler_open()
     g_out_info.status = STAT_BUSY; // make us busy while opening the file
     ivldp_ack_command();           // acknowledge open command
 
+#ifdef VLDP_HWDEC
+    hw_verify_report();
+    hwdec::close();
+#endif
+#ifdef VLDP_MP4
+    if (mp4::active()) {
+        mp4::close();
+        g_in_info->render_blank_frame();
+        g_in_info->render_blank_frame();
+    }
+#endif
     // reset libmpeg2 so it is prepared to begin reading from a new m2v file
     mpeg2_reset(g_mpeg_data, 1);
+#ifdef __LIBRETRO__
+    s_lr_pic = -1;
+    g_lr_vldp_shown_pic = g_lr_presented_pic = -1;
+#endif
 
     // if we have previously opened an mpeg, we need to close it and reset
     if (io_is_open()) {
@@ -520,6 +758,13 @@ void idle_handler_open()
         g_in_info->render_blank_frame();
         g_in_info->render_blank_frame();
     }
+
+#ifdef VLDP_MP4
+    if (!req_precache && mp4::handles(req_file)) {
+        idle_handler_open_mp4(req_file);
+        return;
+    }
+#endif
 
     // if we've been requested to open a real file ...
     if (!req_precache) {
@@ -582,6 +827,21 @@ void idle_handler_open()
 
                 vldp_cache_sequence_header(); // cache sequence header for
                                               // faster seeking
+#ifdef VLDP_HWDEC
+                // the hardware decoder, when chosen and the stream suits it:
+                // look at the first megabyte to decide
+                if (g_lr_vldp_hwdec && !g_out_info.uses_fields) {
+                    const unsigned head_size = 1024 * 1024;
+                    uint8_t *head = (uint8_t *)malloc(head_size);
+                    if (head) {
+                        io_seek(0);
+                        const unsigned got = io_read(head, head_size);
+                        hwdec::open(head, got, g_header_buf_size, (int)g_out_info.w, (int)g_out_info.h,
+                                    hw_draw, lr_decoder_abort, req_file);
+                        free(head);
+                    }
+                }
+#endif
 
                 io_seek(0); // seek back to beginning of file
 
@@ -610,6 +870,34 @@ void idle_handler_open()
     LOGI << "idle_handler_open returning ...";
 #endif
 }
+
+#ifdef VLDP_MP4
+// Opens an MP4 video (Singe 2): the platform decoder replaces libmpeg2 and
+// the frame index (idle_handler_open has acknowledged the command).
+static void idle_handler_open_mp4(const char *req_file)
+{
+    mp4::stream_info info;
+    if (!mp4::open(req_file, draw_planes, lr_decoder_abort, &info)) {
+        g_out_info.status = STAT_ERROR;
+        return;
+    }
+    // mp4::open() checked the size and frame rate are not zero
+    g_out_info.w = (unsigned)info.w;
+    g_out_info.h = (unsigned)info.h;
+    g_out_info.uFpks = get_mpeg_rate() > 0 ? (uint32_t)get_mpeg_rate() : info.fpks;
+    g_out_info.u2milDivFpks = 2000000 / g_out_info.uFpks;
+    g_out_info.uses_fields = 0;
+    g_totalframes = info.frames;
+
+    // the shape of the picture on screen, for pixels that need not be square
+    video::set_aspect_ratio((int)(((double)info.w * info.sar_num / ((double)info.h * info.sar_den)) * 100));
+    video::set_detected_height(info.h);
+    video::set_detected_width(info.w);
+    g_in_info->report_mpeg_dimensions(info.w, info.h);
+
+    g_out_info.status = STAT_STOPPED;
+}
+#endif
 
 // gets called when the user wants to precache a file ...
 void idle_handler_precache()
@@ -791,10 +1079,47 @@ void ivldp_render()
 
     s_skip_all = 0; // default value, don't skip frames unless the play or
                     // paused handler orders it
+#ifdef __LIBRETRO__
+    g_lr_vldp_next_due = 0;
+#endif
 
 #ifdef VLDP_DEBUG
     LOGI << fmt("s_skip_all skipped %u frames.", s_uSkipAllCount);
 #endif // VLDP_DEBUG
+
+#ifdef VLDP_MP4
+    if (mp4::active()) {
+        while (!render_finished) {
+            s_in_render = 1;
+            const bool more = mp4::decode_some();
+            s_in_render = 0;
+            if (!more) {
+                // the end of the video: pause on the last picture, as at the
+                // end of an MPEG-2 file
+                g_out_info.status = STAT_STOPPED;
+                render_finished = 1;
+                mp4::seek(0);
+                s_lr_pic = -1;
+                g_out_info.current_frame = 0;
+            }
+            if (ivldp_got_new_command()) {
+                switch (g_req_cmdORcount & 0xF0) {
+                case VLDP_REQ_QUIT:
+                case VLDP_REQ_OPEN:
+                case VLDP_REQ_SEARCH:
+                case VLDP_REQ_STOP:
+                    g_out_info.status = STAT_BUSY;
+                    render_finished   = 1;
+                    break;
+                case VLDP_REQ_SKIP:
+                    render_finished = 1;
+                    break;
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     // check to make sure a file has been opened
     if (!io_is_open()) {
@@ -813,7 +1138,13 @@ void ivldp_render()
         // tried this
         if (g_buffer != end) {
             // read chunk of video stream
+#ifdef __LIBRETRO__
+            s_in_render = 1;
             decode_mpeg2(g_buffer, end); // display it to the screen
+            s_in_render = 0;
+#else
+            decode_mpeg2(g_buffer, end); // display it to the screen
+#endif
         }
 
         // if we've read to the end of the mpeg2 file, then we can't play
@@ -823,9 +1154,20 @@ void ivldp_render()
                                               // STAT_PAUSED
             render_finished = 1;
 
+#ifdef VLDP_HWDEC
+            // the pictures still inside the hardware decoder
+            if (hwdec::active()) {
+                s_in_render = 1;
+                hwdec::drain();
+                s_in_render = 0;
+            }
+#endif
             // reset libmpeg2 so it is prepared to begin reading from the
             // beginning of the file
-            mpeg2_reset(g_mpeg_data, 1);
+            decoder_reset(1);
+#ifdef __LIBRETRO__
+            s_lr_pic = -1;
+#endif
             io_seek(0);                   // seek to the beginning of the file
             g_out_info.current_frame = 0; // set frame # to beginning of file
                                           // where it belongs
@@ -937,12 +1279,27 @@ void idle_handler_search(int skip)
 
     ivldp_ack_command(); // acknowledge search/skip command
 
+#ifdef __LIBRETRO__
+    s_lr_search_t0_ns  = SDL_GetTicksNS();
+    s_lr_search_timer0 = g_in_info->uMsTimer;
+    s_lr_search_state  = 1;
+#endif
+
+#ifdef VLDP_MP4
+    // MP4 video: the platform decoder seeks by time, without libmpeg2 or the
+    // frame index (below)
+    const bool mp4_video = mp4::active();
+    if (!mp4_video) {
+#endif
     // reset libmpeg2 so it is prepared to start from a new spot
-    mpeg2_reset(g_mpeg_data, 0);
+    decoder_reset(0);
 
     vldp_process_sequence_header(); // we need to process the sequence header
                                     // before we can jump around the file for
                                     // frames
+#ifdef VLDP_MP4
+    }
+#endif
 
     // if we're doing a search...
     if (!skip) {
@@ -983,6 +1340,27 @@ void idle_handler_search(int skip)
             g_in_info->render_blank_frame();
         }
     }
+
+#ifdef VLDP_MP4
+    if (mp4_video) {
+        if (req_frame < g_totalframes) {
+            mp4::seek(req_frame);
+            s_frames_to_skip = s_frames_to_skip_with_inc = 0;
+            s_lr_pic = (int)req_frame - 1;
+            if (!skip) {
+                g_out_info.current_frame = req_frame;
+                s_uPendingSkipFrame = 0;
+            } else
+                s_uPendingSkipFrame = req_frame;
+            s_blanked = 0;
+            ivldp_render();
+        } else {
+            LOGE << fmt("SEARCH ERROR : frame %u was requested, but it is out of bounds", req_frame);
+            g_out_info.status = STAT_ERROR;
+        }
+        return;
+    }
+#endif
 
     // adjusted req frame is the requested frame with fields taken into account
     uAdjustedReqFrame = req_frame;
@@ -1035,6 +1413,10 @@ void idle_handler_search(int skip)
         // go to the place in the stream where the I frame begins
         // fseek(g_mpeg_handle, proposed_pos, SEEK_SET);
 
+#ifdef __LIBRETRO__
+        s_lr_pic = (int)actual_frame - 1;
+        if (g_out_info.uses_fields) s_lr_pic = -1; // not tracked for field streams
+#endif
         // if we're seeking, we can change the frame right now ...
         if (!skip) {
             g_out_info.current_frame =
@@ -1060,6 +1442,93 @@ void idle_handler_search(int skip)
     }
 }
 
+#ifdef __LIBRETRO__
+// Directory for .dat files the core generates itself (set by the frontend).
+static char g_lr_cache_dir[1024] = "";
+
+void vldp_lr_set_cache_dir(const char *dir)
+{
+    SAFE_STRCPY(g_lr_cache_dir, dir ? dir : "", sizeof(g_lr_cache_dir));
+}
+
+// Reads a finished frame index for an mpeg of 'mpeg_size' bytes.  Accepts this
+// engine's own format (v3: 16-byte header, 64-bit offsets) and Daphne 1.0's
+// (v2: 8-byte header, 32-bit offsets), so existing Daphne installs work as-is.
+static VLDP_BOOL lr_read_dat(const char *path, uint64_t mpeg_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return VLDP_FALSE;
+
+    uint8_t hdr[16];
+    VLDP_BOOL ok = VLDP_FALSE;
+    size_t got = fread(hdr, 1, sizeof(hdr), f);
+    int width = 0;
+
+    if (got >= 8 && hdr[0] == 2 && hdr[1] == 1) {
+        uint32_t len = hdr[4] | (hdr[5] << 8) | (hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+        if (len == (uint32_t)mpeg_size) width = 4;
+    } else if (got == 16 && hdr[0] == DAT_VERSION && hdr[1] == 1) {
+        uint64_t len = 0;
+        for (int i = 7; i >= 0; --i) len = (len << 8) | hdr[8 + i];
+        if (len == mpeg_size) width = 8;
+    }
+
+    if (width) {
+        fseek(f, width == 4 ? 8 : 16, SEEK_SET);
+        g_out_info.uses_fields = hdr[2];
+        g_totalframes = 0;
+
+        uint8_t b[8];
+        while (g_totalframes < MAX_LDP_FRAMES && fread(b, width, 1, f) == 1) {
+            uint64_t v = 0;
+            for (int i = width - 1; i >= 0; --i) v = (v << 8) | b[i];
+            if (width == 4 && v == 0xFFFFFFFFu) v = 0xFFFFFFFFFFFFFFFFull;
+            g_frame_position[g_totalframes++] = v;
+        }
+        ok = VLDP_TRUE;
+        LOGI << fmt("Using %s frame index %s (%u frames)", width == 4 ? "Daphne" : "VLDP",
+                    path, g_totalframes);
+    }
+
+    fclose(f);
+    return ok;
+}
+
+VLDP_BOOL ivldp_get_mpeg_frame_offsets(char *mpeg_name)
+{
+    const uint64_t mpeg_size = io_length();
+    char datafilename[1024];
+
+    // 1. the index that ships next to the video (never modified)
+    SAFE_STRCPY(datafilename, mpeg_name, sizeof(datafilename));
+    strcpy(&datafilename[strlen(datafilename) - 3], "dat");
+    if (lr_read_dat(datafilename, mpeg_size)) return VLDP_TRUE;
+
+    // 2. our own cache, keyed by file name and size
+    const char *base = strrchr(mpeg_name, '/');
+    const char *base2 = strrchr(mpeg_name, '\\');
+    if (!base || (base2 && base2 > base)) base = base2;
+    base = base ? base + 1 : mpeg_name;
+
+    char stem[256];
+    SAFE_STRCPY(stem, base, sizeof(stem));
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = '\0';
+
+    if (!g_lr_cache_dir[0]) {
+        LOGE << fmt("No usable frame index for %s and no cache directory", mpeg_name);
+        return VLDP_FALSE;
+    }
+    snprintf(datafilename, sizeof(datafilename), "%s/%s-%llx.dat", g_lr_cache_dir, stem,
+             (unsigned long long)mpeg_size);
+    if (lr_read_dat(datafilename, mpeg_size)) return VLDP_TRUE;
+
+    // 3. build the cache
+    LOGI << fmt("Indexing %s (one time) into %s", mpeg_name, datafilename);
+    if (!ivldp_parse_mpeg_frame_offsets(datafilename, mpeg_size)) return VLDP_FALSE;
+    return lr_read_dat(datafilename, mpeg_size);
+}
+#else
 // parses an mpeg video stream to get its frame offsets, or if the parsing had
 // taken place earlier
 VLDP_BOOL ivldp_get_mpeg_frame_offsets(char *mpeg_name)
@@ -1168,6 +1637,7 @@ VLDP_BOOL ivldp_get_mpeg_frame_offsets(char *mpeg_name)
 
     return result;
 }
+#endif // __LIBRETRO__
 
 VLDP_BOOL ivldp_parse_mpeg_frame_offsets(char *datafilename, uint64_t mpeg_size)
 {
@@ -1378,6 +1848,17 @@ uint64_t io_length()
 
 void draw_frame(const mpeg2_info_t *info)
 {
+    vldp_picture pic = {info->display_fbuf->buf[0], info->display_fbuf->buf[1], info->display_fbuf->buf[2], NULL,
+                        (int)info->sequence->width, (int)info->sequence->chroma_width, 0};
+    draw_planes(pic);
+}
+
+// Shows (or skips) one decoded picture, keeping VLDP's timing.
+void draw_planes(const vldp_picture &pic)
+{
+#ifdef __LIBRETRO__
+    ++s_lr_pic;
+#endif
     Sint32 correct_elapsed_ms = 0;
     Sint32 actual_elapsed_ms  = 0;
     unsigned int uStallFrames = 0;
@@ -1395,18 +1876,32 @@ void draw_frame(const mpeg2_info_t *info)
             s_extra_delay_ms = 0;
 
             if (actual_elapsed_ms < (correct_elapsed_ms + (Sint32)g_out_info.u2milDivFpks)) {
-                int bPrepared = g_in_info->prepare_frame(
-                        info->display_fbuf->buf[0],
-                        info->display_fbuf->buf[1],
-                        info->display_fbuf->buf[2],
-                        info->sequence->width,
-                        info->sequence->chroma_width,
-                        info->sequence->chroma_width
+                int bPrepared;
+#ifdef __LIBRETRO__
+                if (pic.placeholder)
+                    bPrepared = 1; // nothing decoded: the surface keeps what it has
+                else if (pic.uv)
+                    bPrepared = g_in_info->prepare_frame_nv12(pic.y, pic.ypitch, pic.uv, pic.uvpitch);
+                else
+#endif
+                bPrepared = g_in_info->prepare_frame(
+                        (uint8_t *)pic.y, (uint8_t *)pic.u, (uint8_t *)pic.v,
+                        pic.ypitch, pic.uvpitch, pic.uvpitch
                     );
+#ifdef __LIBRETRO__
+                if (bPrepared && !pic.placeholder && s_lr_search_state == 1) {
+                    s_lr_search_ready = (float)((SDL_GetTicksNS() - s_lr_search_t0_ns) / 1e6);
+                    s_lr_search_state = 2;
+                }
+#endif
                 if (bPrepared) {
 #ifndef VLDP_BENCHMARK
                     while (((Sint32)(g_in_info->uMsTimer - s_timer) < correct_elapsed_ms) &&
                            (!bFrameNotShownDueToCmd)) {
+#ifdef __LIBRETRO__
+                        // tell the frontend we are ahead of the emulated clock
+                        g_lr_vldp_wait_timer = g_in_info->uMsTimer;
+#endif
                         SDL_Delay(1);
                         if (ivldp_got_new_command()) {
                             switch (g_req_cmdORcount & 0xF0) {
@@ -1426,14 +1921,36 @@ void draw_frame(const mpeg2_info_t *info)
                         }
                     }
 #endif
+#ifdef __LIBRETRO__
+                    g_lr_vldp_wait_timer = LR_VLDP_NOT_WAITING;
+#endif
                     if (!bFrameNotShownDueToCmd) {
+#ifdef __LIBRETRO__
+                        g_lr_vldp_shown_pic = s_lr_pic;
+                        // a placeholder keeps the picture on screen: showing
+                        // the back buffer would bring back an older one
+                        if (!pic.placeholder)
+#endif
                         g_in_info->display_frame();
+#ifdef __LIBRETRO__
+                        if (s_lr_search_state == 2) {
+                            const unsigned i = s_lr_search_count % LR_SEARCH_SAMPLES;
+                            s_lr_search_ready_ms[i] = s_lr_search_ready;
+                            s_lr_search_shown_ms[i] = (float)(g_in_info->uMsTimer - s_lr_search_timer0);
+                            ++s_lr_search_count;
+                            s_lr_search_state = 0;
+                        }
+#endif
                     }
                 }
             }
 
             if (!bFrameNotShownDueToCmd) {
                 ++s_uFramesShownSinceTimer;
+#ifdef __LIBRETRO__
+                g_lr_vldp_next_due = s_timer + s_extra_delay_ms +
+                    (uint32_t)(((Sint64)s_uFramesShownSinceTimer * 1000000) / g_out_info.uFpks);
+#endif
             }
 
             if (s_paused) {

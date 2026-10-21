@@ -184,10 +184,16 @@ class ldp_vldp : public ldp
     bool seek_audio(Uint64 u64Samples);
     void audio_play(Uint32);
     void audio_pause();
+#ifdef __LIBRETRO__
+    void prefetch_audio();
+#endif
 };
 
 // functions that cannot be part of the class because we may need to use them as
 // function pointers
+#ifdef __LIBRETRO__
+int prepare_frame_nv12_callback(const uint8_t *Yplane, int Ypitch, const uint8_t *UVplane, int UVpitch);
+#endif
 int prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
                            int Ypitch, int Upitch, int Vpitch);
 void display_frame_callback();

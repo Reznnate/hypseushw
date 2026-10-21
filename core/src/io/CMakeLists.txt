@@ -38,10 +38,10 @@ find_package_handle_standard_args(
 set(LIBZIP_VERSION "unknown")
 if (_libzip_pkgcfg)
     file(READ "${_libzip_pkgcfg}" _libzip_pkgcfg_content)
-    string(REGEX MATCH "Version: ([0-9]+\\.[0-9]+\\.[0-9]+)"
+    string(REGEX MATCH "Version: ([0-9]+\\.[0-9]+(\\.[0-9]+)?)"
         _libzip_version_match "${_libzip_pkgcfg_content}")
     if (_libzip_version_match)
-        string(REGEX REPLACE "Version: ([0-9]+\\.[0-9]+\\.[0-9]+)" "\\1"
+        string(REGEX REPLACE "Version: ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" "\\1"
             LIBZIP_VERSION "${_libzip_version_match}")
     endif()
 endif()

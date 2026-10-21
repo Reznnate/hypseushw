@@ -106,7 +106,11 @@ bool invalid_arg(const char *s)
 bool parse_homedir()
 {
     bool result      = true;
+#ifdef __LIBRETRO__
+    char s[400]      = {0}; // the libretro core passes absolute folders
+#else
     char s[81]       = {0};
+#endif
     char e[128];
     bool bHomeDirSet = false; // whether set_homedir was called
 
@@ -176,7 +180,11 @@ bool parse_homedir()
 // found and valid (or not found)
 bool parse_romdir() {
     bool result = true;
+#ifdef __LIBRETRO__
+    char s[400] = {0}; // the libretro core passes absolute folders
+#else
     char s[81] = {0};
+#endif
     char e[128];
 
     for (;;) {
@@ -490,7 +498,7 @@ bool parse_game_type()
         std::fflush(stdout);
         exit(0);
     } else if (strcasecmp(s, "-version") == 0) {
-#if defined(WIN32) || defined(__APPLE__)
+#if (defined(WIN32) || defined(__APPLE__)) && !defined(__LIBRETRO__)
         const char* l = "Hypseus Singe: ";
         const char* l1 = get_hypseus_version();
         const char* l2 = get_sdl_compile();
@@ -498,7 +506,13 @@ bool parse_game_type()
         const char* l4 = get_build_time();
         string s = string(l) + l1 + "\n\n" + l2 + "\n" + l3 + "\n\n" + l4;
 #endif
-#ifdef WIN32
+#if defined(__LIBRETRO__)
+        // no dialogs inside a frontend: to the log
+        printline(get_os_description());
+        printline(get_sdl_compile());
+        printline(get_sdl_linked());
+        printline(get_build_time());
+#elif defined(WIN32)
         MessageBox(NULL, s.c_str(), "Version", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Version", s.c_str(), NULL);

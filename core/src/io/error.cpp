@@ -41,6 +41,14 @@ static bool g_usage = false;
 void printerror(const char *s)
 {
     if (g_usage) return;
+#ifdef __LIBRETRO__
+    // no dialogs (they block the frontend) and no "save me" sound with a
+    // one-second pause: every error is logged, and the frontend shows the
+    // first one (lr_show_error keeps it for the error screen)
+    LOGE << s;
+    lr_show_error(s);
+    return;
+#endif
     static bool alert = true;
 
     if (alert && sound::get_initialized()) {
@@ -120,7 +128,9 @@ void printusage()
 
 )USAGE";
 
-#ifdef WIN32
+#if defined(__LIBRETRO__)
+    LOGI << usage;
+#elif defined(WIN32)
     MessageBox(NULL, usage.c_str(), "Usage", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Usage", usage.c_str(), NULL);

@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HypseusHW contributors
+#
+# DESCRIPTION: GitLab CI/CD for libretro (NOT FOR GitLab-proper)
+# Builds with the libretro CMake templates
+# (libretro-infrastructure/ci-templates).  The CMake project lives in
+# libretro/; its dependencies are git submodules under src/.
+
+##############################################################################
+################################# BOILERPLATE ################################
+##############################################################################
+
+# Core definitions
+.core-defs:
+  variables:
+    CORENAME: hypseushw
+    CORE_ARGS: -DCORE_NAME=hypseushw
+    CMAKE_SOURCE_ROOT: libretro
+    API_LEVEL: 24
+    GIT_SUBMODULE_STRATEGY: normal
+    GIT_SUBMODULE_DEPTH: 1
+
+# Inclusion templates, required for the build to work
+include:
+  ################################## DESKTOPS ################################
+  # Windows
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/windows-cmake-mingw.yml'
+
+  # Linux
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/linux-cmake.yml'
+
+  ################################## CELLULAR ################################
+  # Android
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/android-cmake.yml'
+
+# Stages for building
+stages:
+  - build-prepare
+  - build-shared
+
+##############################################################################
+#################################### STAGES ##################################
+##############################################################################
+#
+################################### DESKTOPS #################################
+# Windows 64-bit
+libretro-build-windows-x64:
+  extends:
+    - .libretro-windows-cmake-x86_64
+    - .core-defs
+
+# Linux 64-bit (Singe 2 MP4 video has no decoder on Linux yet)
+libretro-build-linux-x64:
+  extends:
+    - .libretro-linux-cmake-x86_64
+    - .core-defs
+
+################################### CELLULAR #################################
+# Android ARMv8
+android-arm64-v8a:
+  extends:
+    - .libretro-android-cmake-arm64-v8a
+    - .core-defs

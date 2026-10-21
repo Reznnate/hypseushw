@@ -151,6 +151,9 @@ bool ldp_vldp::init_player()
 
             if (audio_init() && !get_quitflag()) {
                 g_local_info.prepare_frame         = prepare_frame_callback;
+#ifdef __LIBRETRO__
+                g_local_info.prepare_frame_nv12    = prepare_frame_nv12_callback;
+#endif
                 g_local_info.display_frame         = display_frame_callback;
                 g_local_info.report_parse_progress = report_parse_progress_callback;
                 g_local_info.report_mpeg_dimensions = report_mpeg_dimensions_callback;
@@ -378,6 +381,21 @@ bool ldp_vldp::nonblocking_search(char *frame)
                                     // simulate laserdisc lag)
 
     audio_pause(); // pause the audio before we seek so we don't have overrun
+
+#ifdef __LIBRETRO__
+    // How far the shown video was behind the game's frame counter when the
+    // game cut away: frames of the scene that were never shown.  Games
+    // search all the time, so this is debug output.
+    if (g_vldp_info && g_vldp_info->status == STAT_PLAYING) {
+        // frame numbers on the disc: the game's counter, the last picture
+        // VLDP displayed, the last picture the frontend was given
+        const int shown_pic = g_lr_vldp_shown_pic, presented_pic = g_lr_presented_pic;
+        const int shown     = shown_pic >= 0 ? (int)m_cur_ldframe_offset + shown_pic : -1;
+        const int presented = presented_pic >= 0 ? (int)m_cur_ldframe_offset + presented_pic : -1;
+        LOGD << fmt("Cut at frame %u (search to %u): last picture displayed %d, last given to the frontend %d",
+                    m_uCurrentFrame, target_ld_frame, shown, presented);
+    }
+#endif
 
     // do we need to compute seek_delay_ms?
     // (This is best done sooner than later so get_current_frame() is more
@@ -1040,6 +1058,9 @@ bool ldp_vldp::read_frame_conversions()
                     "directory is: %s",
                     m_mpeg_path.c_str());
         result = true;
+#ifdef __LIBRETRO__
+        if (sound::is_enabled()) prefetch_audio();
+#endif
     } else {
         LOGW << fmt("Framefile Parse Error: %s", err_msg.c_str());
         LOGW << fmt("Mpeg Path: %s", m_mpeg_path.c_str());
@@ -1445,6 +1466,31 @@ bool ldp_vldp::parse_framefile(const char *pszInBuf,
 
 //////////////////////////////////////////////////////////////////////
 
+#ifdef __LIBRETRO__
+// True once the VLDP thread has shown every frame due at the current emulated
+// time (it is idle, paused, or waiting for a later frame).
+bool lr_vldp_caught_up()
+{
+    if (!g_vldp_info || g_vldp_info->status != STAT_PLAYING)
+        return true;
+
+    // waiting for its next frame to become due, or decoding one that is not
+    // due yet (the two are read separately: if VLDP moves on in between,
+    // the answer is a frame late at worst)
+    const uint32_t due = g_lr_vldp_next_due;
+    return g_lr_vldp_wait_timer == g_local_info.uMsTimer ||
+           (due && (int32_t)(g_local_info.uMsTimer - due) < 0);
+}
+
+void lr_vldp_debug(char *buf, size_t len)
+{
+    snprintf(buf, len, "vldp status=%d timer=%u wait=%u frame=%u",
+             g_vldp_info ? (int)g_vldp_info->status : -1, g_local_info.uMsTimer,
+             (unsigned)g_lr_vldp_wait_timer,
+             g_vldp_info ? (unsigned)g_vldp_info->current_frame : 0);
+}
+#endif
+
 // returns VLDP_TRUE on success, VLDP_FALSE on failure
 int prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
                            int Ypitch, int Upitch, int Vpitch)
@@ -1462,9 +1508,26 @@ int prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
     return result;
 }
 
+#ifdef __LIBRETRO__
+int prepare_frame_nv12_callback(const uint8_t *Yplane, int Ypitch, const uint8_t *UVplane, int UVpitch)
+{
+    const int result = video::lr_update_yuv_overlay_nv12(Yplane, Ypitch, UVplane, UVpitch) == 0
+                           ? VLDP_TRUE : VLDP_FALSE;
+    if (g_take_screenshot) {
+        g_take_screenshot = false;
+        video::set_queue_screenshot(true);
+    }
+    return result;
+}
+#endif
+
 // displays the frame as fast as possible
 void display_frame_callback()
 {
+#ifdef __LIBRETRO__
+    // The frame prepared earlier is now due: make it the visible one.
+    video::vid_commit_yuv_overlay();
+#endif
     // MAC: vid_blit() updates all textures from their corresponding surfaces as needed.
     // It's not called from here anymore, but from game::blit() instead,
     // because it runs on every frame-complete
@@ -1530,6 +1593,9 @@ void update_parse_meter(const string &strFilename)
             {
                 SDL_Color color = {255, 255, 255, 255};
 
+#ifdef __LIBRETRO__
+                if (!engine || !font) return;
+#endif
                 TTF_Text *tt = TTF_CreateText(engine, font, text, strlen(text));
                 if (!tt) return;
 

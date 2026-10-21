@@ -96,6 +96,12 @@ struct vldp_in_info {
     // this function instead)
     unsigned int (*GetTicksFunc)();
     const char *Uid;
+
+#ifdef __LIBRETRO__
+    // Like prepare_frame, from a picture whose U and V samples are
+    // interleaved (NV12), as hardware decoders put them out.
+    int (*prepare_frame_nv12)(const uint8_t *Yplane, int Ypitch, const uint8_t *UVplane, int UVpitch);
+#endif
 };
 
 // functions and state information provided to the parent thread from VLDP
@@ -202,6 +208,22 @@ struct vldp_out_info {
 
 enum { STAT_ERROR, STAT_BUSY, STAT_STOPPED, STAT_PLAYING, STAT_PAUSED };
 
+#ifdef __LIBRETRO__
+// Where VLDP writes frame indexes it has to build itself.  Indexes next to
+// the video are only ever read (Daphne 1.0 v2 and VLDP v3 formats).
+void vldp_lr_set_cache_dir(const char *dir);
+
+// Search/skip response samples since the last reset: real ms until the
+// target frame was decoded, game ms until it was shown.
+void vldp_lr_reset_search_stats(void);
+unsigned vldp_lr_search_stats(const float **ready_ms, const float **shown_ms);
+#if defined(__ANDROID__) // builds with VLDP_HWDEC (vldp_hwdec.h)
+// DAPHNE_LR_VERIFY_HWDEC result for the open file: pictures compared,
+// different, without a libmpeg2 counterpart.  Returns 0 when the check is off.
+int vldp_lr_hwdec_check(unsigned long *checked, unsigned long *differ, unsigned long *unmatched);
+#endif
+#endif
+
 #ifdef WIN32
 // this is the only function that gets exported by this DLL
 __declspec(dllexport) const
@@ -218,6 +240,39 @@ const struct vldp_out_info *vldp_init(const struct vldp_in_info *in_info);
 
 #ifdef __cplusplus
 }
+#endif
+
+#if defined(__LIBRETRO__) && defined(__cplusplus)
+#include <atomic>
+
+// Shared between the VLDP thread, the game thread and the frontend.  Each is
+// read on its own: a reader that sees one of them change a moment before
+// another acts on it a frame later at most.
+
+// uMsTimer value the VLDP thread last saw while waiting for its next frame to
+// become due, or LR_VLDP_NOT_WAITING while it is decoding/seeking.  The
+// frontend compares this with the current timer to know VLDP has caught up.
+#define LR_VLDP_NOT_WAITING 0xFFFFFFFFu
+extern std::atomic<uint32_t> g_lr_vldp_wait_timer;
+// uMsTimer value at which the frame the VLDP thread is decoding next becomes
+// due (0 when unknown, e.g. right after a play or search).  While uMsTimer is
+// below it there is nothing for the frontend to wait for.
+extern std::atomic<uint32_t> g_lr_vldp_next_due;
+
+// Video frame number (in the open file) of the last picture VLDP displayed,
+// and of the last one the frontend was given; -1 when unknown.
+extern std::atomic<int> g_lr_vldp_shown_pic;
+extern std::atomic<int> g_lr_presented_pic;
+
+// Non-zero to decode with the platform's hardware decoders; the frontend
+// clears it for the CPU Fallback core option.  It chooses:
+//  - MPEG-2 on Android: MediaCodec's hardware decoder where the stream
+//    suits it (vldp_hwdec), else libmpeg2;
+//  - MP4 (Singe 2) on Android: the device's decoder, else Android's
+//    software decoder (vldp_mp4);
+//  - MP4 on Windows: Media Foundation with or without hardware transforms.
+// Read when a video file is opened.
+extern std::atomic<int> g_lr_vldp_hwdec;
 #endif
 
 #endif // VLDP_H

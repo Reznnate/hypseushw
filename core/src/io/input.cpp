@@ -1039,11 +1039,16 @@ int SDL_input_init()
 {
     int result = 0;
 
+#ifdef __LIBRETRO__
+    // the core runs one game after another in the same process
+    thisGame = g_game->get_game_type();
+#else
     if (thisGame == GAME_UNDEFINED)
         thisGame = g_game->get_game_type();
 
     // Set ini based argument list (Note: will override cli arguments)
     CFG_System();
+#endif
 
     // make sure the coin queue is empty (it should be, this is just a safety
     // check)
@@ -1054,6 +1059,13 @@ int SDL_input_init()
     g_sticky_coin_cycles =
         (Uint32)(STICKY_COIN_SECONDS * cpu::get_hz(0)); // only needs to be
                                                         // calculated once
+
+#ifdef __LIBRETRO__
+    // The frontend owns the controllers and delivers switches through
+    // input_enable()/input_disable(); no ini file, devices or mice here.
+    idle_timer = refresh_ms_time();
+    return 1;
+#endif
 
     if (g_use_gamepad)
     {
@@ -1181,6 +1193,10 @@ void SDL_input_shutdown(void)
 void SDL_check_input()
 {
     SDL_Event event{};
+
+#ifdef __LIBRETRO__
+    lr_input_drain();
+#endif
 
     while ((SDL_PollEvent(&event)) && (!get_quitflag()))
     {

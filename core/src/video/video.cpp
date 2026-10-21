@@ -25,6 +25,7 @@
 #include "../game/game.h"
 #include "../io/conout.h"
 #include "../io/error.h"
+#include "../io/homedir.h"
 #include "../io/mpo_fileio.h"
 #include "../io/mpo_mem.h"
 #include "icon.h"
@@ -35,6 +36,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#ifdef __LIBRETRO__
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#endif
 
 namespace video {
 
@@ -83,6 +94,31 @@ SDL_Renderer *g_scoreboard_renderer    = NULL;
 SDL_Surface *g_led_bmps[LED_RANGE]     = {0};
 SDL_Surface *g_other_bmps[B_EMPTY]     = {0};
 SDL_Surface *g_overlay_surface         = NULL;
+#ifdef __LIBRETRO__
+// Writes to g_overlay_surface set s_ov_dirty.  Once a game's overlay arrives
+// through vid_update_overlay_surface (Singe's full-size RGBA overlays),
+// lr_frame_begin() trusts the flag instead of comparing every pixel each frame.
+static bool s_ov_dirty = false;
+static bool s_ov_tracked = false;
+// The game overlays g_overlay_surface currently equals (games double-buffer
+// them; emptied once anything else draws on it), and the one the game said
+// it left unchanged since it was last passed in.
+static SDL_Surface *s_ov_mirrors[4] = {NULL};
+static SDL_Surface *s_ov_same = NULL;
+static int s_ov_mirror_dx = 0, s_ov_mirror_dy = 0;
+static void ov_mirrors_clear() { for (auto &m : s_ov_mirrors) m = NULL; }
+static bool ov_mirrors_has(SDL_Surface *s)
+{
+    for (auto m : s_ov_mirrors) if (m == s) return true;
+    return false;
+}
+static void ov_mirrors_add(SDL_Surface *s)
+{
+    if (ov_mirrors_has(s)) return;
+    for (auto &m : s_ov_mirrors) if (!m) { m = s; return; }
+    s_ov_mirrors[0] = s;
+}
+#endif
 SDL_Surface *g_scoreboard_surface      = NULL;
 SDL_Surface *g_aux_blit_surface        = NULL;
 SDL_Surface *g_scoreboard_blit_surface = NULL;
@@ -161,6 +197,17 @@ typedef struct {
 
 m_yuv_surface_t                        *g_yuv_surface;
 std::vector<SDL_Rect>                  displayDimensions;
+
+#ifdef __LIBRETRO__
+// g_yuv_surface receives frames as VLDP prepares them; g_yuv_visible holds the
+// frame VLDP has declared due (display_frame), which is what gets composited.
+static m_yuv_surface_t                 *g_yuv_visible = NULL;
+static bool                            g_lr_yuv_dirty = false;
+// VLDP re-creates the YUV surfaces from its own thread when it learns the
+// MPEG size; this guards (re)allocation against the frontend compositing.
+static std::recursive_mutex            g_lr_yuv_alloc;
+static SDL_Surface                     *g_console_font = NULL;
+#endif
 
 m_textureT g_mix_texture               = {.t = NULL, .w = 0, .h = 0 };
 
@@ -456,9 +503,55 @@ static bool draw_ranks()
     return true;
 }
 
+#ifdef __LIBRETRO__
+// The frontend owns the window: only set up the surfaces the engine draws into.
+static bool lr_init_display()
+{
+    g_overlay_width = g_game->get_video_overlay_width();
+    g_overlay_height = g_game->get_video_overlay_height();
+
+    g_probe_width = std::max((int)g_probe_width, 320);
+    g_probe_height = std::max((int)g_probe_height, 240);
+    g_viewport_width = g_probe_width;
+    g_viewport_height = g_probe_height;
+    g_scaling_rect = g_logical_rect = {0, 0, g_viewport_width, g_viewport_height};
+
+    if (g_game->m_software_scoreboard && !g_scoreboard_blit_surface)
+        g_scoreboard_blit_surface = SDL_CreateSurface(g_scoreboard_w, g_scoreboard_h,
+                                                      SDL_PIXELFORMAT_RGBA32);
+
+    if (!g_overlay_surface)
+        g_overlay_surface = SDL_CreateSurface(g_overlay_width, g_overlay_height,
+                                              SDL_PIXELFORMAT_RGBA32);
+    if (!g_overlay_surface)
+    {
+        LOGE << fmt("Could not initialize g_overlay_surface: %s", SDL_GetError());
+        return false;
+    }
+
+    VIDEO_ASSIGN(ENHANCE_OVERLAY, g_game->has_overlay_upgrade(GAME_OVERLAY_UPGRADE));
+    VIDEO_ASSIGN(OVERLAY_DYNAMIC, g_game->get_dynamic_overlay());
+
+    ConvertSurface(&g_other_bmps[B_OVERLAY_LEDS], g_overlay_surface->format);
+    Uint32 colorkey = SDL_MapSurfaceRGB(g_other_bmps[B_OVERLAY_LEDS], 0, 0, 0);
+    SDL_SetSurfaceColorKey(g_other_bmps[B_OVERLAY_LEDS], true, colorkey);
+
+    ConvertSurface(&g_other_bmps[B_OVERLAY_LDP1450], g_overlay_surface->format);
+    colorkey = SDL_MapSurfaceRGB(g_other_bmps[B_OVERLAY_LDP1450], 0, 0, 0);
+    SDL_SetSurfaceColorKey(g_other_bmps[B_OVERLAY_LDP1450], true, colorkey);
+
+    VIDEO_ASSIGN(INDEX8, (g_game->get_overlay_depth() == GAME_OVERLAY_STD) ? true : false);
+    VIDEO_SET(INITPASS);
+    return true;
+}
+#endif
+
 // Initialize the display systems
 bool init_display()
 {
+#ifdef __LIBRETRO__
+    return lr_init_display();
+#endif
     bool result = false;
     constexpr char title[] = "HYPSEUS Singe: Multiple Arcade Laserdisc Emulator";
 
@@ -890,6 +983,9 @@ void reset_yuv_overlay()
 
 void vid_free_yuv_overlay()
 {
+#ifdef __LIBRETRO__
+    std::lock_guard<std::recursive_mutex> lock(g_lr_yuv_alloc);
+#endif
     // Here we free both the YUV surface and YUV texture.
     SDL_DestroyMutex (g_yuv_surface->mutex);
    
@@ -897,6 +993,18 @@ void vid_free_yuv_overlay()
     free(g_yuv_surface->Uplane);
     free(g_yuv_surface->Vplane);
     free(g_yuv_surface);
+
+#ifdef __LIBRETRO__
+    if (g_yuv_visible)
+    {
+        SDL_DestroyMutex(g_yuv_visible->mutex);
+        free(g_yuv_visible->Yplane);
+        free(g_yuv_visible->Uplane);
+        free(g_yuv_visible->Vplane);
+        free(g_yuv_visible);
+        g_yuv_visible = NULL;
+    }
+#endif
 
     if (g_yuv_texture)
         SDL_DestroyTexture(g_yuv_texture);
@@ -938,6 +1046,10 @@ bool deinit_display()
     g_font = nullptr;
     g_ttfont = nullptr;
     g_font_engine = nullptr;
+#ifdef __LIBRETRO__
+    SDL_DestroySurface(g_console_font);
+    g_console_font = NULL;
+#endif
 
     SDL_DestroyTexture(g_bezel_texture);
 
@@ -1015,7 +1127,7 @@ static void colorLeds(SDL_Surface *src)
 
 static SDL_Surface *load_led_strip(const char *filename)
 {
-    std::string filepath = fmt("pics/%s", filename);
+    std::string filepath = LR_ASSET(fmt("pics/%s", filename));
 
     SDL_Surface *result  = SDL_LoadBMP(filepath.c_str());
 
@@ -1035,7 +1147,7 @@ static SDL_Surface *load_one_bmp(const char *filename, bool bezel)
         filepath = fmt("%s/%s", g_bezel_path.c_str(), filename);
 
     if (!mpo_file_exists(filepath.c_str()))
-        filepath = fmt("pics/%s", filename);
+        filepath = LR_ASSET(fmt("pics/%s", filename));
 
     SDL_Surface *result  = SDL_LoadBMP(filepath.c_str());
 
@@ -1052,7 +1164,7 @@ static SDL_Surface *load_one_png(const char *filename)
     std::string filepath = fmt("%s/%s", g_bezel_path.c_str(), filename);
 
     if (!mpo_file_exists(filepath.c_str()))
-        filepath = fmt("pics/%s", filename);
+        filepath = LR_ASSET(fmt("pics/%s", filename));
 
     SDL_Surface *result = IMG_Load(filepath.c_str());
 
@@ -1238,6 +1350,10 @@ void draw_overlay_leds(unsigned int values[], int num_digits,
                        int start_x, int y)
 {
     SDL_Rect src, dest;
+#ifdef __LIBRETRO__
+    s_ov_dirty = true;
+    ov_mirrors_clear();
+#endif
 
     dest.x = start_x;
     dest.y = y;
@@ -1275,6 +1391,10 @@ void draw_overlay_leds(unsigned int values[], int num_digits,
 void draw_singleline_LDP1450(char *LDP1450_String, int start_x, int y)
 {
     SDL_Rect src, dest;
+#ifdef __LIBRETRO__
+    s_ov_dirty = true;
+    ov_mirrors_clear();
+#endif
 
     int i = 0;
     int value = 0;
@@ -1385,7 +1505,17 @@ std::vector<SDL_Rect> get_displays() { return displayDimensions; }
 SDL_Renderer *get_renderer() { return g_renderer; }
 SDL_Window *get_window() { return g_window; }
 SDL_Texture *get_overlay_texture() { return g_overlay_texture; }
+#ifdef __LIBRETRO__
+// callers draw into it (overlay scoreboard)
+SDL_Surface *get_screen_leds()
+{
+    s_ov_dirty = true;
+    ov_mirrors_clear();
+    return g_overlay_surface;
+}
+#else
 SDL_Surface *get_screen_leds() { return g_overlay_surface; }
+#endif
 SDL_Rect get_scoreboard_rect() { return g_scoreboard_bezel_rect; }
 SDL_Rect get_aux_rect() { return g_aux_rect; }
 
@@ -1538,9 +1668,14 @@ void set_yuv_blank(int value)
     g_yuv_display = value;
 
     if (value == YUV_BLANK)
+    {
         vid_update_yuv_overlay(g_yuv_surface->Yplane, g_yuv_surface->Uplane,
             g_yuv_surface->Vplane, g_yuv_surface->Ypitch, g_yuv_surface->Upitch,
             g_yuv_surface->Vpitch);
+#ifdef __LIBRETRO__
+        vid_commit_yuv_overlay();
+#endif
+    }
 }
 
 void set_scalefactor(int value)
@@ -1842,9 +1977,54 @@ void set_video_height(Uint16 height)
     VIDEO_SET(RESIZED_MEDIA);
 }
 
+#ifdef __LIBRETRO__
+// Daphne 1.0 console font: 256 glyphs of 6x13 in a single strip.
+static void lr_draw_console_text(const char *t, int x, int y, SDL_Surface *overlay,
+                                 SDL_Color c)
+{
+    if (!g_console_font)
+    {
+        g_console_font = SDL_LoadBMP(LR_ASSET("pics/ConsoleFont.bmp").c_str());
+        if (!g_console_font)
+        {
+            LOGE << "Could not load pics/ConsoleFont.bmp";
+            return;
+        }
+        // glyphs are white on a magenta key
+        SDL_SetSurfaceColorKey(g_console_font, true,
+                               SDL_MapSurfaceRGB(g_console_font, 0xff, 0, 0xff));
+    }
+
+    SDL_SetSurfaceColorMod(g_console_font, c.r, c.g, c.b);
+    SDL_Rect src = {0, 0, 6, 13};
+    SDL_Rect dst = {x, y, 6, 13};
+
+    for (; *t; ++t, dst.x += 6)
+    {
+        src.x = (unsigned char)*t * 6;
+        SDL_BlitSurface(g_console_font, &src, overlay, &dst);
+    }
+}
+#endif
+
 void draw_string(const char *t, int col, int row, SDL_Surface *overlay,
                      SDL_Color rgb, bool outline)
 {
+#ifdef __LIBRETRO__
+    if (!g_ttfont)
+    {
+        if (outline)
+        {
+            static const SDL_Color padding = {0x3D, 0x38, 0x36, 0xFF};
+            static const int offsets[4][2] = {{-1, 0}, {1, 0}, {0,-1}, {0, 1}};
+            for (int i = 0; i < 4; ++i)
+                lr_draw_console_text(t, col + offsets[i][0], row + offsets[i][1],
+                                     overlay, padding);
+        }
+        lr_draw_console_text(t, col, row, overlay, rgb);
+        return;
+    }
+#endif
     SDL_Rect dest;
     dest.y = (int16_t)(row);
     dest.x = (int16_t)(col);
@@ -1885,6 +2065,10 @@ void draw_string(const char *t, int col, int row, SDL_Surface *overlay,
 void draw_srt(const char *s, uint8_t func, int pos = -1)
 {
     if (!s) return;
+#ifdef __LIBRETRO__
+    // drawn with SDL's renderer, which a libretro core has not got
+    if (!g_font || !g_font_engine) return;
+#endif
 
     static int message_timer = 0;
     static float base_y = 90.0f;
@@ -1973,6 +2157,10 @@ void draw_srt(const char *s, uint8_t func, int pos = -1)
 void draw_subtitle(const char *s, uint8_t func, bool center = false)
 {
     if (!s) return;
+#ifdef __LIBRETRO__
+    // drawn with SDL's renderer, which a libretro core has not got
+    if (!g_font || !g_font_engine) return;
+#endif
 
     SDL_FPoint p;
     p.y = (g_scaling_rect.h * 0.92f) + g_scaling_rect.y;
@@ -2124,6 +2312,9 @@ void vid_scoreboard_switch()
 
 void vid_setup_yuv_overlay (int width, int height)
 {
+#ifdef __LIBRETRO__
+    std::lock_guard<std::recursive_mutex> lock(g_lr_yuv_alloc);
+#endif
     // Prepare the YUV overlay, wich means setting up both the YUV surface and YUV texture.
 
     // If we have already been here, free things first.
@@ -2163,7 +2354,500 @@ void vid_setup_yuv_overlay (int width, int height)
         g_yuv_frect[0]->y = (float)((height / 2) - (g_yuv_frect[0]->h / 2));
         g_yuv_frect[1] = copy_rect(g_yuv_frect[0]);
     }
+
+#ifdef __LIBRETRO__
+    // black, like the visible one: the two are swapped
+    memset(g_yuv_surface->Yplane, 0x10, g_yuv_surface->Ysize);
+    memset(g_yuv_surface->Uplane, 0x80, g_yuv_surface->Usize);
+    memset(g_yuv_surface->Vplane, 0x80, g_yuv_surface->Vsize);
+
+    g_yuv_visible = (m_yuv_surface_t*) malloc (sizeof(m_yuv_surface_t));
+    *g_yuv_visible = *g_yuv_surface;
+    g_yuv_visible->Yplane = (uint8_t*) malloc (g_yuv_visible->Ysize);
+    g_yuv_visible->Uplane = (uint8_t*) malloc (g_yuv_visible->Usize);
+    g_yuv_visible->Vplane = (uint8_t*) malloc (g_yuv_visible->Vsize);
+    g_yuv_visible->mutex = SDL_CreateMutex();
+    memset(g_yuv_visible->Yplane, 0x10, g_yuv_visible->Ysize);
+    memset(g_yuv_visible->Uplane, 0x80, g_yuv_visible->Usize);
+    memset(g_yuv_visible->Vplane, 0x80, g_yuv_visible->Vsize);
+    g_lr_yuv_dirty = true;
+#endif
 }
+
+#ifdef __LIBRETRO__
+// Called by VLDP when the frame it prepared is due to be shown.
+void vid_commit_yuv_overlay()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_lr_yuv_alloc);
+    if (!g_yuv_surface || !g_yuv_visible) return;
+
+    m_yuv_surface_t *back = g_yuv_surface, *front = g_yuv_visible;
+    SDL_LockMutex(back->mutex);
+    SDL_LockMutex(front->mutex);
+
+    // Every vid_update_yuv_overlay() path (blend, luma and grayscale included)
+    // rewrites the whole back buffer from the decoder's picture, so the two
+    // are exchanged rather than copied.  The frontend side reads the visible
+    // one under g_lr_yuv_alloc, which we hold.
+    g_yuv_surface = front;
+    g_yuv_visible = back;
+    g_lr_yuv_dirty = true;
+
+    SDL_UnlockMutex(front->mutex);
+    SDL_UnlockMutex(back->mutex);
+}
+
+// BT.601 limited range, 16.16 fixed point
+#if defined(__aarch64__)
+// 16 pixels of one row; same fixed-point math as the scalar loop below, so
+// the output is bit-identical.
+static inline void yuv_to_xrgb_neon16(const uint8_t *Y, const uint8_t *U, const uint8_t *V,
+                                      uint32_t *d)
+{
+    const uint8x16_t y8 = vld1q_u8(Y);
+    const uint8x8_t u8 = vld1_u8(U), v8 = vld1_u8(V);
+
+    // chroma: one sample per two pixels
+    const int16x8_t u16 = vreinterpretq_s16_u16(vsubl_u8(u8, vdup_n_u8(128)));
+    const int16x8_t v16 = vreinterpretq_s16_u16(vsubl_u8(v8, vdup_n_u8(128)));
+    const int16x8x2_t uu = vzipq_s16(u16, u16);
+    const int16x8x2_t vv = vzipq_s16(v16, v16);
+
+    const int16x8_t yl = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(y8), vdup_n_u8(16)));
+    const int16x8_t yh = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(y8), vdup_n_u8(16)));
+    const int16x4_t ys[4] = {vget_low_s16(yl), vget_high_s16(yl), vget_low_s16(yh), vget_high_s16(yh)};
+    const int16x4_t us[4] = {vget_low_s16(uu.val[0]), vget_high_s16(uu.val[0]),
+                             vget_low_s16(uu.val[1]), vget_high_s16(uu.val[1])};
+    const int16x4_t vs[4] = {vget_low_s16(vv.val[0]), vget_high_s16(vv.val[0]),
+                             vget_low_s16(vv.val[1]), vget_high_s16(vv.val[1])};
+
+    uint16x4_t r16[4], g16[4], b16[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        const int32x4_t c = vmulq_n_s32(vmovl_s16(ys[i]), 76309);
+        const int32x4_t u = vmovl_s16(us[i]), v = vmovl_s16(vs[i]);
+        r16[i] = vqshrun_n_s32(vmlaq_n_s32(c, v, 104597), 16);
+        g16[i] = vqshrun_n_s32(vmlaq_n_s32(vmlaq_n_s32(c, u, -25675), v, -53279), 16);
+        b16[i] = vqshrun_n_s32(vmlaq_n_s32(c, u, 132201), 16);
+    }
+
+    for (int h = 0; h < 2; ++h)
+    {
+        uint8x8x4_t px;
+        px.val[0] = vqmovn_u16(vcombine_u16(b16[2 * h], b16[2 * h + 1]));
+        px.val[1] = vqmovn_u16(vcombine_u16(g16[2 * h], g16[2 * h + 1]));
+        px.val[2] = vqmovn_u16(vcombine_u16(r16[2 * h], r16[2 * h + 1]));
+        px.val[3] = vdup_n_u8(0);
+        vst4_u8((uint8_t *)(d + 8 * h), px);
+    }
+}
+#endif
+
+// One row of a YUV420 surface to XRGB8888.  Assumes an even width, as MPEG
+// pictures (whole macroblocks) always have: U and V hold width/2 samples.
+static void yuv420_row_to_xrgb(const lr_frame &f, int y, uint32_t *d)
+{
+    const int w = f.w;
+    const uint8_t *Y = f.y + (size_t)y * f.ypitch;
+    const uint8_t *U = f.u + (size_t)(y >> 1) * f.upitch;
+    const uint8_t *V = f.v + (size_t)(y >> 1) * f.vpitch;
+
+    int x = 0;
+#if defined(__aarch64__)
+    for (; x + 16 <= w; x += 16)
+        yuv_to_xrgb_neon16(Y + x, U + (x >> 1), V + (x >> 1), d + x);
+#endif
+    for (; x < w; ++x)
+    {
+        const int c = (Y[x] - 16) * 76309;
+        const int u = U[x >> 1] - 128;
+        const int v = V[x >> 1] - 128;
+
+        int r = (c + 104597 * v) >> 16;
+        int g = (c - 25675 * u - 53279 * v) >> 16;
+        int b = (c + 132201 * u) >> 16;
+
+        r = r < 0 ? 0 : (r > 255 ? 255 : r);
+        g = g < 0 ? 0 : (g > 255 ? 255 : g);
+        b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
+        d[x] = (uint32_t)(r << 16 | g << 8 | b);
+    }
+}
+
+// What lr_compose_cpu() hands to each band of rows.
+struct compose_job {
+    const lr_frame *yuv;        // set when the video rows must be converted
+    uint32_t *video, *out;
+    int w, h;
+    const uint8_t *ov;          // RGBA32 overlay; NULL when there is none to blend
+    int ov_pitch;
+    SDL_Rect lr;
+    const int *xmap;
+    const uint8_t *orow_used;
+};
+
+// Convert (if needed) and composite rows [y0, y1) in one pass, so each row
+// is still in cache when it is blended.
+static void compose_rows(const compose_job &j, int y0, int y1)
+{
+    for (int y = y0; y < y1; ++y)
+    {
+        uint32_t *vrow = j.video + (size_t)y * j.w;
+        uint32_t *drow = j.out + (size_t)y * j.w;
+
+        if (j.yuv) yuv420_row_to_xrgb(*j.yuv, y, vrow);
+
+        const int oy = j.ov ? j.lr.y + (int)(((int64_t)y * j.lr.h) / j.h) : 0;
+        if (!j.ov || !j.orow_used[oy - j.lr.y])
+        {
+            memcpy(drow, vrow, (size_t)j.w * sizeof(uint32_t));
+            continue;
+        }
+
+        // RGBA32 is byte order R,G,B,A
+        const uint8_t *orow = j.ov + (size_t)oy * j.ov_pitch;
+        for (int x = 0; x < j.w; ++x)
+        {
+            const uint8_t *p = orow + j.xmap[x];
+            const uint32_t a = p[3];
+
+            if (a == 0)
+                drow[x] = vrow[x];
+            else if (a == 255)
+                drow[x] = (uint32_t)(p[0] << 16 | p[1] << 8 | p[2]);
+            else
+            {
+                const uint32_t v = vrow[x];
+                const uint32_t ia = 255 - a;
+                const uint32_t r = (p[0] * a + ((v >> 16) & 0xff) * ia) / 255;
+                const uint32_t g = (p[1] * a + ((v >> 8) & 0xff) * ia) / 255;
+                const uint32_t b = (p[2] * a + (v & 0xff) * ia) / 255;
+                drow[x] = r << 16 | g << 8 | b;
+            }
+        }
+    }
+}
+
+// Two helper threads share the rows with the calling thread, so a 720p
+// frame fits in the frontend's frame time next to the game and MPEG decoder
+// threads.  Rows go out in small bands to whichever thread is free, so one
+// thread being preempted does not hold up a third of the frame.
+namespace {
+class compose_pool
+{
+  public:
+    static const int WORKERS = 2;
+    static const int BANDS   = 16;
+
+    // lr_compose_shutdown() joins the threads; if the frontend exits without
+    // unloading, let them go rather than abort in std::thread's destructor
+    ~compose_pool()
+    {
+        for (auto &t : m_threads)
+            if (t.joinable()) t.detach();
+    }
+
+    void run(const compose_job &job)
+    {
+        start();
+        {
+            std::lock_guard<std::mutex> l(m_mutex);
+            m_job = &job;
+            m_next_band = 0;
+            m_pending = WORKERS;
+            ++m_generation;
+        }
+        m_wake.notify_all();
+
+        do_bands(job);
+
+        std::unique_lock<std::mutex> l(m_mutex);
+        m_done.wait(l, [this] { return m_pending == 0; });
+        m_job = NULL;
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> l(m_mutex);
+            m_quit = true;
+        }
+        m_wake.notify_all();
+        for (auto &t : m_threads) t.join();
+        m_threads.clear();
+        m_quit = false;
+    }
+
+  private:
+    void do_bands(const compose_job &j)
+    {
+        for (int b; (b = m_next_band.fetch_add(1)) < BANDS;)
+            compose_rows(j, (int)((int64_t)j.h * b / BANDS), (int)((int64_t)j.h * (b + 1) / BANDS));
+    }
+
+    void start()
+    {
+        if (!m_threads.empty()) return;
+        for (int i = 0; i < WORKERS; ++i)
+            m_threads.emplace_back(&compose_pool::worker, this);
+    }
+
+    void worker()
+    {
+        lr_register_cpu_thread(LR_THREAD_COMPOSE);
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> l(m_mutex);
+        for (;;)
+        {
+            m_wake.wait(l, [&] { return m_quit || m_generation != seen; });
+            if (m_quit) return;
+            seen = m_generation;
+            const compose_job *job = m_job;
+            l.unlock();
+
+            do_bands(*job);
+
+            l.lock();
+            if (--m_pending == 0) m_done.notify_one();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_wake, m_done;
+    std::vector<std::thread> m_threads;
+    const compose_job *m_job = NULL;
+    std::atomic<int> m_next_band{0};
+    uint64_t m_generation = 0;
+    int m_pending = 0;
+    bool m_quit = false;
+};
+
+compose_pool g_compose_pool;
+}
+
+void lr_compose_shutdown() { g_compose_pool.stop(); }
+
+// What the next frame is made of, shared by the CPU and GPU renderers.
+static m_yuv_surface_t *s_frame_locked = NULL;
+static std::unique_lock<std::recursive_mutex> s_frame_alloc_lock;
+static bool s_frame_force = false;
+
+// What lr_frame_begin() last saw, to tell what changed.
+static std::vector<uint8_t> s_ov_copy;   // untracked overlays (see s_ov_tracked)
+static const void *s_ov_pixels = NULL;   // tracked overlays: which surface,
+static size_t s_ov_bytes = 0;            // and its size
+static SDL_Rect s_ov_rect;
+static int s_vw = 0, s_vh = 0, s_w = 0, s_h = 0;
+
+// The CPU renderer's buffers: the converted video, the composite, and the
+// overlay's column map and used rows.
+static std::vector<uint32_t> s_cpu_video, s_cpu_out, s_cpu_prev;
+static std::vector<int> s_cpu_xmap;
+static std::vector<uint8_t> s_cpu_orow_used;
+
+void lr_frame_invalidate() { s_frame_force = true; }
+
+void lr_overlay_unchanged(SDL_Surface *overlay) { s_ov_same = overlay; }
+
+void lr_frame_reset()
+{
+    std::vector<uint8_t>().swap(s_ov_copy);
+    s_ov_rect = SDL_Rect{0, 0, 0, 0};
+    s_ov_pixels = NULL;
+    s_ov_bytes = 0;
+    s_ov_tracked = false;
+    s_ov_dirty = false;
+    ov_mirrors_clear();
+    s_ov_same = NULL;
+    s_vw = s_vh = s_w = s_h = 0;
+    std::vector<uint32_t>().swap(s_cpu_video);
+    std::vector<uint32_t>().swap(s_cpu_out);
+    std::vector<uint32_t>().swap(s_cpu_prev);
+    std::vector<int>().swap(s_cpu_xmap);
+    std::vector<uint8_t>().swap(s_cpu_orow_used);
+    s_frame_force = true;
+}
+
+// Collects the visible laserdisc frame and the game overlay, and works out
+// what changed since the last call.  Locks the video surface until
+// lr_frame_end(), so the VLDP thread cannot swap or reallocate it meanwhile.
+void lr_frame_begin(lr_frame *f)
+{
+    *f = lr_frame();
+    const bool force = s_frame_force;
+    s_frame_force = false;
+
+    s_frame_alloc_lock = std::unique_lock<std::recursive_mutex>(g_lr_yuv_alloc);
+    m_yuv_surface_t *visible = g_yuv_visible;
+    if (visible)
+    {
+        SDL_LockMutex(visible->mutex);
+        s_frame_locked = visible;
+
+        if (force || g_lr_yuv_dirty || s_vw != visible->width || s_vh != visible->height)
+        {
+            s_vw = visible->width;
+            s_vh = visible->height;
+            g_lr_yuv_dirty = false;
+            f->video_changed = true;
+        }
+        f->y = visible->Yplane;
+        f->u = visible->Uplane;
+        f->v = visible->Vplane;
+        f->ypitch = visible->Ypitch;
+        f->upitch = visible->Upitch;
+        f->vpitch = visible->Vpitch;
+    }
+
+    // The frame is the size of the MPEG video, or the viewport before any
+    // video has been seen.
+    f->has_video = s_vw != 0;
+    f->w = s_vw ? s_vw : g_viewport_width;
+    f->h = s_vh ? s_vh : g_viewport_height;
+    bool changed = f->video_changed || force;
+    if (f->w != s_w || f->h != s_h)
+    {
+        s_w = f->w;
+        s_h = f->h;
+        changed = true;
+    }
+
+    // Like SDL_RenderTexture: the source rect is clipped to the overlay and
+    // what remains is stretched over the whole frame.
+    SDL_Surface *ov = g_overlay_surface;
+    SDL_Rect lr = {0, 0, 0, 0};
+    if (ov)
+    {
+        const SDL_Rect bounds = {0, 0, ov->w, ov->h};
+        if (!SDL_GetRectIntersection(&g_limit_rect, &bounds, &lr))
+            lr.w = lr.h = 0;
+    }
+
+    // Most games redraw their (small) overlay through several paths, so its
+    // pixels are compared with the last composited copy.  Overlays that come
+    // through vid_update_overlay_surface report their own changes.
+    const size_t ov_bytes = ov ? (size_t)ov->pitch * ov->h : 0;
+    bool ov_changed;
+    if (s_ov_tracked)
+    {
+        const void *pixels = ov ? ov->pixels : NULL;
+        ov_changed = s_ov_dirty || pixels != s_ov_pixels || ov_bytes != s_ov_bytes;
+        s_ov_pixels = pixels;
+        s_ov_bytes = ov_bytes;
+        if (!s_ov_copy.empty()) std::vector<uint8_t>().swap(s_ov_copy);
+    }
+    else
+        ov_changed = ov_bytes != s_ov_copy.size() ||
+                     (ov_bytes && memcmp(s_ov_copy.data(), ov->pixels, ov_bytes) != 0);
+    s_ov_dirty = false;
+    if (force || ov_changed || !SDL_RectsEqual(&lr, &s_ov_rect))
+    {
+        if (!s_ov_tracked)
+            s_ov_copy.assign((const uint8_t *)(ov ? ov->pixels : NULL),
+                             (const uint8_t *)(ov ? ov->pixels : NULL) + ov_bytes);
+        s_ov_rect = lr;
+        f->ov_changed = true;
+        changed = true;
+    }
+
+    if (ov && lr.w > 0 && lr.h > 0)
+    {
+        f->ov = (const uint8_t *)ov->pixels;
+        f->ov_pitch = ov->pitch;
+        f->ov_w = ov->w;
+        f->ov_h = ov->h;
+        f->lr = lr;
+    }
+
+    f->unchanged = !changed;
+    f->compose = changed;
+
+    // DAPHNE_LR_VERIFY_DUPES=1: recomposite frames reported as unchanged and
+    // check they really are (development aid)
+    static const bool s_verify = SDL_getenv("DAPHNE_LR_VERIFY_DUPES") != NULL;
+    if (s_verify && !changed)
+    {
+        f->verify_dupe = true;
+        f->compose = true;
+    }
+
+    int aw = f->w, ah = f->h;
+    if (!VIDEO_HAS(IGNORE_ASPECT) && g_aspect_width > 0 && g_aspect_height > 0)
+    {
+        aw = g_aspect_width;
+        ah = g_aspect_height;
+    }
+    f->aspect = VIDEO_HAS(FORCE_ASPECT) ? 4.0f / 3.0f : (float)aw / (float)ah;
+}
+
+void lr_frame_end()
+{
+    if (s_frame_locked) SDL_UnlockMutex(s_frame_locked->mutex);
+    s_frame_locked = NULL;
+    if (s_frame_alloc_lock.owns_lock()) s_frame_alloc_lock.unlock();
+}
+
+// The CPU renderer: composites the frame into XRGB8888.  Only does any work
+// when f.compose is set; otherwise returns the previous frame.
+const uint32_t *lr_compose_cpu(const lr_frame &f)
+{
+    std::vector<uint32_t> &s_video = s_cpu_video, &s_out = s_cpu_out, &s_prev = s_cpu_prev;
+    std::vector<int> &s_xmap = s_cpu_xmap;
+    std::vector<uint8_t> &s_orow_used = s_cpu_orow_used;
+    const size_t n = (size_t)f.w * f.h;
+    const lr_frame *convert = NULL;
+
+    if (f.video_changed && f.y)
+    {
+        s_video.resize(n);
+        convert = &f;
+    }
+    else if (s_video.size() != n)
+        s_video.assign(n, 0); // no video yet: black
+    if (s_out.size() != n) s_out.resize(n);
+
+    if (f.verify_dupe) s_prev = s_out;
+
+    if (f.compose)
+    {
+        compose_job job = {convert, s_video.data(), s_out.data(), f.w, f.h, NULL, 0, f.lr, NULL, NULL};
+
+        if (f.ov)
+        {
+            const SDL_Rect &lr = f.lr;
+            if ((int)s_xmap.size() != f.w) s_xmap.resize(f.w);
+            for (int x = 0; x < f.w; ++x)
+                s_xmap[x] = (lr.x + (int)(((int64_t)x * lr.w) / f.w)) * 4;
+
+            // Overlays are mostly transparent: find the rows with any visible
+            // pixel once, and copy the video straight through everywhere else.
+            s_orow_used.assign(lr.h, 0);
+            for (int oy = 0; oy < lr.h; ++oy)
+            {
+                const uint8_t *o = f.ov + (size_t)(lr.y + oy) * f.ov_pitch + (size_t)lr.x * 4;
+                uint8_t any = 0;
+                for (int x = 0; x < lr.w; ++x) any |= o[4 * x + 3]; // alpha
+                s_orow_used[oy] = any != 0;
+            }
+
+            job.ov = f.ov;
+            job.ov_pitch = f.ov_pitch;
+            job.xmap = s_xmap.data();
+            job.orow_used = s_orow_used.data();
+        }
+
+        g_compose_pool.run(job);
+    }
+
+    if (f.verify_dupe && s_prev != s_out)
+    {
+        LOGE << "repeated frame differs from a full composite";
+    }
+
+    return s_out.data();
+}
+#endif
 
 static void vid_flash_yuv_surface()
 {
@@ -2282,6 +2966,10 @@ int vid_update_yuv_overlay(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
     // the mutex, but if it's already taken, LockMutex doesn't return
     // until the mutex is free and we can lock(=get) it here.
 
+#ifdef __LIBRETRO__
+    std::lock_guard<std::recursive_mutex> alloc_lock(g_lr_yuv_alloc);
+    if (!g_yuv_surface) return 0;
+#endif
     SDL_LockMutex(g_yuv_surface->mutex);
 
     switch(g_yuv_display)
@@ -2352,6 +3040,55 @@ int vid_update_yuv_overlay(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
     return 0;
 }
 
+#ifdef __LIBRETRO__
+// One row of interleaved U/V samples into separate U and V rows.
+void lr_deinterleave_uv(const uint8_t *uv, uint8_t *u, uint8_t *v, int n)
+{
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 16 <= n; i += 16) {
+        uint8x16x2_t p = vld2q_u8(uv + 2 * i);
+        vst1q_u8(u + i, p.val[0]);
+        vst1q_u8(v + i, p.val[1]);
+    }
+#endif
+    for (; i < n; ++i) {
+        u[i] = uv[2 * i];
+        v[i] = uv[2 * i + 1];
+    }
+}
+
+int lr_update_yuv_overlay_nv12(const uint8_t *Yplane, int Ypitch, const uint8_t *UVplane, int UVpitch)
+{
+    std::unique_lock<std::recursive_mutex> alloc_lock(g_lr_yuv_alloc);
+    if (!g_yuv_surface) return 0;
+    const int cw = g_yuv_surface->width / 2, ch = g_yuv_surface->height / 2;
+
+    // Blanking, flashing and the picture effects stay with the planar path.
+    if (g_yuv_display != YUV_VISIBLE || g_yuv_flags) {
+        // scratch planes kept between pictures (VLDP thread only)
+        static std::vector<uint8_t> u, v;
+        u.resize((size_t)cw * ch);
+        v.resize((size_t)cw * ch);
+        for (int r = 0; r < ch; ++r)
+            lr_deinterleave_uv(UVplane + (size_t)r * UVpitch, &u[(size_t)r * cw], &v[(size_t)r * cw], cw);
+        return vid_update_yuv_overlay((uint8_t *)Yplane, u.data(), v.data(), Ypitch, cw, cw);
+    }
+
+    SDL_LockMutex(g_yuv_surface->mutex);
+    copyPlane(g_yuv_surface->Yplane, Yplane, g_yuv_surface->width, g_yuv_surface->height, Ypitch);
+    for (int r = 0; r < ch; ++r)
+        lr_deinterleave_uv(UVplane + (size_t)r * UVpitch, g_yuv_surface->Uplane + (size_t)r * cw,
+                        g_yuv_surface->Vplane + (size_t)r * cw, cw);
+    g_yuv_surface->Ypitch = g_yuv_surface->width;
+    g_yuv_surface->Upitch = cw;
+    g_yuv_surface->Vpitch = cw;
+    g_yuv_video_needs_update = true;
+    SDL_UnlockMutex(g_yuv_surface->mutex);
+    return 0;
+}
+#endif
+
 void vid_update_overlay_surface(SDL_Surface *overlay)
 {
     if (VIDEO_HAS(BLOCK_DRIVER_OVERLAY))
@@ -2374,9 +3111,83 @@ void vid_update_overlay_surface(SDL_Surface *overlay)
     if (VIDEO_HAS(INDEX8))
     {
         SDL_BlitSurface(overlay, NULL, g_overlay_surface, dst);
+#ifdef __LIBRETRO__
+        if (g_overlay_texture) // none in the core: it composites the surface
+#endif
         SDL_UpdateTexture(g_overlay_texture, &src,
              (void *)g_overlay_surface->pixels, g_overlay_surface->pitch);
     }
+#ifdef __LIBRETRO__
+    else
+    {
+        // Singe sets its overlay's size from the script (overlaySetResolution);
+        // the copy follows, as the overlay texture does in a desktop build
+        if (g_overlay_surface &&
+            (g_overlay_surface->w != overlay->w || g_overlay_surface->h != overlay->h))
+        {
+            SDL_Surface *s = SDL_CreateSurface(overlay->w, overlay->h, SDL_PIXELFORMAT_RGBA32);
+            if (s)
+            {
+                SDL_DestroySurface(g_overlay_surface);
+                g_overlay_surface = s;
+                ov_mirrors_clear();
+                g_overlay_width = overlay->w;
+                g_overlay_height = overlay->h;
+                if (!VIDEO_HAS(ENHANCE_OVERLAY)) g_limit_rect = src;
+            }
+        }
+        // No texture to upload to: copy the RGBA overlay, only the rows that
+        // changed, and note whether any did.  Singe overlays can be full HD,
+        // so this replaces a full copy here plus a full compare every frame
+        // in lr_frame_begin().
+        if (!g_overlay_surface)
+            return;
+        // (a blit to dst only uses its position)
+        const int dx = dst ? dst->x : 0, dy = dst ? dst->y : 0;
+        const bool same = s_ov_same == overlay;
+        s_ov_same = NULL;
+        if (same && ov_mirrors_has(overlay) && dx == s_ov_mirror_dx && dy == s_ov_mirror_dy)
+        {
+            s_ov_tracked = true; // the game drew nothing new since the last copy
+            return;
+        }
+        if (overlay->format == g_overlay_surface->format &&
+            SDL_BYTESPERPIXEL(overlay->format) == 4 && dx >= 0 && dy >= 0 &&
+            dx + overlay->w <= g_overlay_surface->w && dy + overlay->h <= g_overlay_surface->h)
+        {
+            const size_t row = (size_t)overlay->w * 4;
+            bool copied = false;
+            for (int y = 0; y < overlay->h; ++y)
+            {
+                const uint8_t *s = (const uint8_t *)overlay->pixels + (size_t)y * overlay->pitch;
+                uint8_t *d = (uint8_t *)g_overlay_surface->pixels +
+                             (size_t)(y + dy) * g_overlay_surface->pitch + (size_t)dx * 4;
+                if (memcmp(d, s, row) != 0)
+                {
+                    memcpy(d, s, row);
+                    copied = true;
+                }
+            }
+            // unchanged: it also still equals the overlays it equalled before
+            if (copied || dx != s_ov_mirror_dx || dy != s_ov_mirror_dy)
+            {
+                s_ov_dirty = true;
+                ov_mirrors_clear();
+            }
+            ov_mirrors_add(overlay);
+            s_ov_mirror_dx = dx;
+            s_ov_mirror_dy = dy;
+        }
+        else
+        {
+            SDL_SetSurfaceBlendMode(overlay, SDL_BLENDMODE_NONE);
+            SDL_BlitSurface(overlay, NULL, g_overlay_surface, dst);
+            s_ov_dirty = true;
+            ov_mirrors_clear();
+        }
+        s_ov_tracked = true;
+    }
+#endif
 }
 
 static void take_screenshot()
@@ -2648,6 +3459,11 @@ static void vid_render_bezels()
 
 void vid_blit()
 {
+#ifdef __LIBRETRO__
+    // the frontend composites once per retro_run() (lr_frame_begin() and
+    // lr_compose_cpu() or a GPU renderer)
+    return;
+#endif
     // *IF* we get to SDL_VIDEO_BLIT from game::blit(), then the access to the
     // overlay and scoreboard textures is done from the "hypseus" thread, that blocks
     // until all blitting operations are completed and only then loops again, so NO
@@ -2786,6 +3602,9 @@ int get_yuv_overlay_height()
 
 bool get_yuv_overlay_ready()
 {
+#ifdef __LIBRETRO__
+    return g_yuv_surface != NULL;
+#endif
     if (g_yuv_surface && g_yuv_texture) return true;
     return false;
 }

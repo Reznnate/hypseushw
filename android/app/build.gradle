@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 HypseusHW contributors
+
+plugins {
+    id 'com.android.application'
+}
+
+// The libretro core is built separately (libretro/CMakeLists.txt) so that
+// RetroArch and this app run the exact same binary. Point coreLib at it.
+def repoRoot = file('../..')
+def coreLib = project.findProperty('coreLib') ?:
+        "${repoRoot}/build/core-android-arm64/hypseushw_libretro_android.so"
+
+// Release signing comes from android/keystore.properties (not committed):
+//   storeFile=/path/to/release.jks
+//   storePassword=...
+//   keyAlias=...
+//   keyPassword=...
+// Without it the release APK is left unsigned.
+def keystoreFile = rootProject.file('keystore.properties')
+def keystore = new Properties()
+if (keystoreFile.exists()) keystoreFile.withInputStream { keystore.load(it) }
+
+android {
+    namespace = 'net.daphnelr.player'
+    compileSdk = 35
+    ndkVersion = '29.0.14206865'
+
+    defaultConfig {
+        applicationId = 'net.daphnelr.player'
+        minSdk = 24
+        // Games are passed as file paths (shared storage, NAS mounts), so the
+        // app asks for "All files access" (MANAGE_EXTERNAL_STORAGE).
+        targetSdk = 34
+        versionCode = 1
+        versionName = '0.1.0'
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static', "-DREPO_ROOT=${repoRoot}"
+                abiFilters 'arm64-v8a'
+            }
+        }
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+
+    sourceSets.main {
+        // SDL's Java glue is used straight from the SDL source tree
+        java.srcDirs += "${repoRoot}/src/SDL3/android-project/app/src/main/java"
+        jniLibs.srcDirs = ["${buildDir}/corelib"]
+        assets.srcDirs += "${buildDir}/notices"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file('jni/CMakeLists.txt')
+            version = '3.22.1'
+        }
+    }
+
+    packaging {
+        // extract native libs so the core can be dlopen'ed by path
+        jniLibs.useLegacyPackaging = true
+    }
+
+    signingConfigs {
+        if (keystoreFile.exists()) {
+            release {
+                storeFile = file(keystore['storeFile'])
+                storePassword = keystore['storePassword']
+                keyAlias = keystore['keyAlias']
+                keyPassword = keystore['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = false
+            if (keystoreFile.exists()) signingConfig = signingConfigs.release
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+// Android only packages libraries named lib*.so.  Sync, not Copy, so a core
+// built under an earlier name is not packaged alongside the current one.
+tasks.register('copyCore', Sync) {
+    from(coreLib) { rename { 'libhypseushw_libretro_android.so' } }
+    into "${buildDir}/corelib/arm64-v8a"
+}
+preBuild.dependsOn copyCore
+
+// The licence and third-party notices travel inside the APK (assets/)
+tasks.register('copyNotices', Copy) {
+    from("${repoRoot}/LICENSE", "${repoRoot}/THIRD_PARTY.md")
+    into "${buildDir}/notices"
+}
+preBuild.dependsOn copyNotices

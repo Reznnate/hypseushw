@@ -1,0 +1,41 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 HypseusHW contributors
+ *
+ * Engine configuration for the libretro build (replaces core/src/config.h.in).
+ */
+#ifndef LR_CONFIG_H
+#define LR_CONFIG_H
+
+#define hypseus_VERSION_MAJOR    3
+#define hypseus_VERSION_MINOR    0
+#define hypseus_VERSION_POINT    2
+#define hypseus_VERSION          "3.0.2-libretro"
+
+/* the core's own version: display_version in hypseushw_libretro.info */
+#define LR_VERSION               "@LR_VERSION@"
+#cmakedefine LR_BUILD_STAMP
+
+#if defined(_WIN32)
+#  ifndef WIN32
+#    define WIN32
+#  endif
+#elif defined(__APPLE__)
+#  define MAC_OSX
+#else
+#  define UNIX
+#  define LINUX
+#endif
+
+/* Singe (Lua scripted games) */
+#define BUILD_SINGE
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#  define NATIVE_CPU_X86
+#endif
+
+#if defined(__arm__) || defined(__aarch64__)
+#  define NATIVE_ARM
+#endif
+
+#endif

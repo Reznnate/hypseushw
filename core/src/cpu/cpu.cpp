@@ -53,6 +53,11 @@
 
 #include <stack>	// for cpu pausing operations
 
+#ifdef __LIBRETRO__
+// most emulated time the CPUs catch up on at once: two frames
+#define LR_MAX_CPU_BACKLOG_MS 33
+#endif
+
 using namespace std;
 
 namespace cpu
@@ -631,6 +636,20 @@ void execute()
 
 #ifdef CPU_DIAG
 		unsigned int uStartMs = actual_elapsed_ms;
+#endif
+
+#ifdef __LIBRETRO__
+		// The engine falls far behind when a blocking laserdisc command
+		// (opening a file, waiting for the decoder) held it up, or when the
+		// device cannot keep up.  Emulating all the missed time at once would
+		// overrun the frontend's frame, so treat it like a pause: the CPUs do
+		// not see that time pass, and a device that keeps overrunning plays
+		// slower rather than stalling.
+		if (actual_elapsed_ms > g_expected_elapsed_ms + LR_MAX_CPU_BACKLOG_MS)
+		{
+			g_timer += actual_elapsed_ms - g_expected_elapsed_ms;
+			actual_elapsed_ms = g_expected_elapsed_ms;
+		}
 #endif
 
 		// if we're behind, then compute how far behind we are ...

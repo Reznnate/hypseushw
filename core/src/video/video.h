@@ -179,8 +179,57 @@ bool deinit_display();
 void vid_setup_yuv_overlay (int width, int height);
 // MAC : REMEMBER, vid_update_yuv_overlay() ONLY updates the YUV surface. The YUV texture is updated on vid_blit()
 int vid_update_yuv_overlay (uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane, int Ypitch, int Upitch, int Vpitch);
+#ifdef __LIBRETRO__
+// vid_update_yuv_overlay() for an NV12 picture: splits U and V straight into
+// the surface.
+int lr_update_yuv_overlay_nv12(const uint8_t *Yplane, int Ypitch, const uint8_t *UVplane, int UVpitch);
+// One row of NV12 chroma (n U/V pairs) into separate U and V rows.
+void lr_deinterleave_uv(const uint8_t *uv, uint8_t *u, uint8_t *v, int n);
+#endif
 int vid_update_yuv_texture (uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane, int Ypitch, int Upitch, int Vpitch);
 void vid_free_yuv_overlay ();
+
+#ifdef __LIBRETRO__
+void vid_commit_yuv_overlay();
+// stops the compositing helper threads (they restart on the next frame)
+void lr_compose_shutdown();
+
+// One output frame: the visible laserdisc frame with the game overlay
+// stretched over it.  Filled by lr_frame_begin(); the pointers stay valid
+// until lr_frame_end().
+struct lr_frame {
+    int w = 0, h = 0;              // output size (the MPEG size once video is seen)
+    float aspect = 4.0f / 3.0f;    // display aspect ratio
+    bool unchanged = false;        // identical to the previous frame
+    bool compose = false;          // the CPU renderer must recomposite
+
+    bool has_video = false;        // some video has been seen (else black)
+    bool video_changed = false;    // the planes differ from the previous frame
+    const uint8_t *y = NULL, *u = NULL, *v = NULL; // YUV 4:2:0 planes, w x h
+    int ypitch = 0, upitch = 0, vpitch = 0;
+
+    const uint8_t *ov = NULL;      // overlay, RGBA byte order; NULL if none
+    int ov_pitch = 0, ov_w = 0, ov_h = 0;
+    SDL_Rect lr = {0, 0, 0, 0};    // part of the overlay stretched over the frame
+    bool ov_changed = false;
+
+    bool verify_dupe = false;      // DAPHNE_LR_VERIFY_DUPES check of this frame
+};
+
+void lr_frame_begin(lr_frame *f);
+void lr_frame_end();
+// Report video and overlay as changed next frame (the GPU lost its copies).
+void lr_frame_invalidate();
+// Forget the last frame and free the CPU renderer's buffers, so the next game
+// does not start on this one's picture.  Call between games, outside
+// lr_frame_begin()/lr_frame_end().
+void lr_frame_reset();
+// The game left this overlay exactly as it was when last passed to
+// vid_update_overlay_surface(), which may then skip comparing it.
+void lr_overlay_unchanged(SDL_Surface *overlay);
+// The CPU renderer; returns the XRGB8888 frame, f.w x f.h.
+const uint32_t *lr_compose_cpu(const lr_frame &f);
+#endif
 
 void vid_update_overlay_surface(SDL_Surface *tx);
 void vid_blit();

@@ -223,6 +223,9 @@ void shutdown_chip();
 void update_buffer(); // update the sound buffers with 1 ms worth of data
 bool init();
 void shutdown();
+#ifdef __LIBRETRO__
+void lr_mix(int16_t *out, unsigned frames);
+#endif
 bool play(Uint32 whichone);
 bool play_saveme();
 int load_waves();

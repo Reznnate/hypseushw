@@ -36,4 +36,9 @@ unsigned int elapsed_ms_time(unsigned int previous_time)
     return (GET_TICKS() - previous_time);
 }
 
+#ifdef __LIBRETRO__
+// Only used by VLDP for command-handshake timeouts, which are real time.
+unsigned int GetTicksFunc() { return (unsigned int)lr_real_ticks(); }
+#else
 unsigned int GetTicksFunc() { return GET_TICKS(); }
+#endif

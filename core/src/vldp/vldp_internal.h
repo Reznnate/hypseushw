@@ -76,6 +76,18 @@ VLDP_BOOL io_is_open();
 uint64_t io_length();
 
 void draw_frame(const mpeg2_info_t *info);
+// A decoded picture: planar 4:2:0 (u, v), or with U and V interleaved (uv,
+// NV12) as MediaCodec and Media Foundation put them out.  A placeholder has
+// no pixels: it stands for a picture the stream numbering has but the
+// decoder did not put out (a B-picture libmpeg2 would show after a reset, a
+// gap in an MP4's picture times).  It counts as a frame for VLDP's timing,
+// keeps the picture on screen, and does not swap the frontend's buffers.
+struct vldp_picture {
+    const uint8_t *y, *u, *v, *uv;
+    int ypitch, uvpitch;
+    int placeholder;
+};
+void draw_planes(const vldp_picture &pic);
 
 ///////////////////////////////////////
 

@@ -24,6 +24,9 @@
 #include "singe_interface.h"
 
 #include "../../video/video.h"
+#if defined(__LIBRETRO__) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include "../../vldp/vldp_nonstd.h"
 #include "../../video/palette.h"
 #include "../../sound/sound.h"
@@ -177,6 +180,11 @@ static const SDL_Color m_colorTransparent = {0, 0, 0, 0};
 
 int (*g_original_prepare_frame)(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
                int Ypitch, int Upitch, int Vpitch);
+#ifdef __LIBRETRO__
+// the hardware decoder's NV12 pictures (Android)
+static int (*g_original_prepare_frame_nv12)(const uint8_t *Yplane, int Ypitch,
+               const uint8_t *UVplane, int UVpitch);
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -580,6 +588,11 @@ static void sep_capture_vldp()
     // Intercept VLDP callback
     g_original_prepare_frame = g_pSingeIn->g_local_info->prepare_frame;
     g_pSingeIn->g_local_info->prepare_frame = sep_prepare_frame_callback;
+#ifdef __LIBRETRO__
+    g_original_prepare_frame_nv12 = g_pSingeIn->g_local_info->prepare_frame_nv12;
+    if (g_original_prepare_frame_nv12)
+        g_pSingeIn->g_local_info->prepare_frame_nv12 = sep_prepare_frame_nv12_callback;
+#endif
 }
 
 static bool sep_init_mixer()
@@ -676,6 +689,31 @@ int sep_prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane
     return result;
 }
 
+#ifdef __LIBRETRO__
+// As sep_prepare_frame_callback, for NV12 pictures
+int sep_prepare_frame_nv12_callback(const uint8_t *Yplane, int Ypitch,
+                           const uint8_t *UVplane, int UVpitch)
+{
+    if (m_blank.trip) sep_do_blank();
+
+    int result = g_original_prepare_frame_nv12(Yplane, Ypitch, UVplane, UVpitch);
+
+    if (SEP_HAS(SEP_PIXELREADY))
+    {
+        for (int y = 0; y < g_se_vldp_height; ++y)
+            memcpy(m_se_yuv_buf.Y.get() + (size_t)y * g_se_vldp_width,
+                   Yplane + (size_t)y * Ypitch, g_se_vldp_width);
+        for (int y = 0; y < m_se_yuv_buf.UVh; ++y)
+            video::lr_deinterleave_uv(UVplane + (size_t)y * UVpitch,
+                                      m_se_yuv_buf.U.get() + (size_t)y * m_se_yuv_buf.UVw,
+                                      m_se_yuv_buf.V.get() + (size_t)y * m_se_yuv_buf.UVw,
+                                      m_se_yuv_buf.UVw);
+    }
+
+    return result;
+}
+#endif
+
 void sep_print(const char *fmt, ...)
 {
     char message[2048];
@@ -697,6 +735,10 @@ void sep_print(const char *fmt, ...)
 void sep_release_vldp()
 {
     g_pSingeIn->g_local_info->prepare_frame = g_original_prepare_frame;
+#ifdef __LIBRETRO__
+    if (g_original_prepare_frame_nv12)
+        g_pSingeIn->g_local_info->prepare_frame_nv12 = g_original_prepare_frame_nv12;
+#endif
 }
 
 void sep_set_static_pointers(double *m_disc_fps, unsigned int *m_uDiscFPKS)
@@ -759,8 +801,20 @@ void sep_set_surface(int width, int height)
 
             m_tx.srfbpp = surfFmt->bits_per_pixel;
         }
+#ifdef __LIBRETRO__
+        else
+        {
+            // no overlay texture: the 32-bit modes convert in place and
+            // sep_do_blit copies the result to the game's overlay
+            m_tx = {0};
+            m_tx.width = g_se_surface->w;
+            m_tx.height = g_se_surface->h;
+            m_tx.bpp = m_tx.srfbpp = 32;
+        }
+#else
         else
             m_tx = {0};
+#endif
     }
 
     if (m_se_yuv_buf.width != g_se_vldp_width || m_se_yuv_buf.height != g_se_vldp_height)
@@ -1196,6 +1250,9 @@ static bool sep_fullalpha_srf32(SDL_Surface *src, SDL_Texture *dst)
         (m_tx.bpp == 32) && (m_tx.srfbpp == 32)
     )
     {
+#ifdef __LIBRETRO__
+        if (dst) // no texture in the core (see sep_do_blit)
+#endif
         SDL_UpdateTexture(dst, NULL, (void *)src->pixels, src->pitch);
         bResult = true;
     }
@@ -1254,6 +1311,9 @@ static bool sep_format_srf32(SDL_Surface *src, SDL_Texture *dst)
 
         SDL_UnlockSurface(src);
 
+#ifdef __LIBRETRO__
+        if (dst) // no texture in the core (see sep_do_blit)
+#endif
         SDL_UpdateTexture(dst, NULL, src->pixels, src->pitch);
 
         bResult = true;
@@ -1301,6 +1361,9 @@ static bool sep_format_monochrome(SDL_Surface *src, SDL_Texture *dst)
 
         SDL_UnlockSurface(src);
 
+#ifdef __LIBRETRO__
+        if (dst) // no texture in the core (see sep_do_blit)
+#endif
         SDL_UpdateTexture(dst, NULL, src->pixels, src->pitch);
 
         bResult = true;
@@ -1308,10 +1371,93 @@ static bool sep_format_monochrome(SDL_Surface *src, SDL_Texture *dst)
     return bResult;
 }
 
+#if defined(__LIBRETRO__) && SDL_BYTEORDER == SDL_LIL_ENDIAN
+// sep_format_srf32 / sep_fullalpha_srf32 and the copy to the game's overlay
+// in one pass, for the core (no overlay texture).  Singe 2 overlays are full
+// HD, so each extra pass over them costs milliseconds on a TV box.  In an
+// RGBA32 surface on a little-endian machine alpha is the top byte and
+// PIXEL_ABGR8888 rebuilds the pixel unchanged, so "more than half opaque, or
+// cleared" is p & (p's sign bit, spread).  Only pixels that differ are
+// written, and the result says whether any did: Singe 2 scripts redraw every
+// frame, mostly to the same picture.
+static bool sep_srf32_to_overlay(SDL_Surface *src, SDL_Surface *dst, bool threshold)
+{
+    bool changed = false;
+    SDL_LockSurface(src);
+    SDL_LockSurface(dst);
+    for (int y = 0; y < src->h; ++y)
+    {
+        Uint32 *s = (Uint32 *)((Uint8 *)src->pixels + (size_t)y * src->pitch);
+        Uint32 *d = (Uint32 *)((Uint8 *)dst->pixels + (size_t)y * dst->pitch);
+        if (!threshold)
+        {
+            if (memcmp(d, s, (size_t)src->w * 4) != 0)
+            {
+                memcpy(d, s, (size_t)src->w * 4);
+                changed = true;
+            }
+            continue;
+        }
+        int x = 0;
+#if defined(__aarch64__)
+        // 16 pixels a step; overlays are mostly transparent and unchanged,
+        // so the stores are rare
+        for (; x + 16 <= src->w; x += 16)
+        {
+            uint32x4_t o[4], ds = vdupq_n_u32(0), dd = vdupq_n_u32(0);
+            for (int k = 0; k < 4; ++k)
+            {
+                const uint32x4_t p = vld1q_u32(s + x + 4 * k);
+                o[k] = vandq_u32(p, vreinterpretq_u32_s32(
+                                        vshrq_n_s32(vreinterpretq_s32_u32(p), 31)));
+                ds = vorrq_u32(ds, veorq_u32(o[k], p));
+                dd = vorrq_u32(dd, veorq_u32(o[k], vld1q_u32(d + x + 4 * k)));
+            }
+            if (vmaxvq_u32(ds))
+                for (int k = 0; k < 4; ++k) vst1q_u32(s + x + 4 * k, o[k]);
+            if (vmaxvq_u32(dd))
+            {
+                for (int k = 0; k < 4; ++k) vst1q_u32(d + x + 4 * k, o[k]);
+                changed = true;
+            }
+        }
+#endif
+        for (; x < src->w; ++x)
+        {
+            const Uint32 p = s[x];
+            const Uint32 out = p & (Uint32)((Sint32)p >> 31);
+            if (out != p) s[x] = out; // as the in-place conversion leaves it
+            if (d[x] != out)
+            {
+                d[x] = out;
+                changed = true;
+            }
+        }
+    }
+    SDL_UnlockSurface(dst);
+    SDL_UnlockSurface(src);
+    return changed;
+}
+#endif
+
 void sep_do_blit(SDL_Surface *srfDest)
 {
     if (SEP_HAS(SEP_SRT_DISPLAY))
         UpdateSRT(m_srt, g_pSingeIn->get_current_frame());
+
+#if defined(__LIBRETRO__) && SDL_BYTEORDER == SDL_LIL_ENDIAN
+    if (!g_se_texture && srfDest &&
+        (m_upgrade_overlay == SEP_OVERLAY_FULL || m_upgrade_overlay == SEP_OVERLAY_ALPHA) &&
+        srfDest->format == SDL_PIXELFORMAT_RGBA32 && g_se_surface->format == SDL_PIXELFORMAT_RGBA32 &&
+        srfDest->w == g_se_surface->w && srfDest->h == g_se_surface->h &&
+        m_tx.width == g_se_surface->w && m_tx.height == g_se_surface->h &&
+        m_tx.bpp == 32 && m_tx.srfbpp == 32)
+    {
+        if (!sep_srf32_to_overlay(g_se_surface, srfDest, m_upgrade_overlay == SEP_OVERLAY_FULL))
+            video::lr_overlay_unchanged(srfDest);
+        return;
+    }
+#endif
 
     switch (m_upgrade_overlay) {
         case SEP_OVERLAY_ALPHA:
@@ -1326,8 +1472,21 @@ void sep_do_blit(SDL_Surface *srfDest)
             break;
         default:
             sep_srf32_to_srf8(g_se_surface, srfDest);
-            break;
+            return;
     }
+#ifdef __LIBRETRO__
+    // The 32-bit modes went to the overlay texture, which a libretro core has
+    // not got: the game's overlay surface, which the core composites, gets
+    // the converted picture instead.
+    if (!g_se_texture && srfDest)
+    {
+        SDL_SetSurfaceBlendMode(g_se_surface, SDL_BLENDMODE_NONE);
+        if (srfDest->w == g_se_surface->w && srfDest->h == g_se_surface->h)
+            SDL_BlitSurface(g_se_surface, NULL, srfDest, NULL);
+        else // sizes differ, e.g. the panel scoreboard halves the overlay width
+            SDL_BlitSurfaceScaled(g_se_surface, NULL, srfDest, NULL, SDL_SCALEMODE_NEAREST);
+    }
+#endif
 }
 
 static ZipMem sep_unzip(const std::string& s)

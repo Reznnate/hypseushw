@@ -59,6 +59,12 @@ void homedir::set_homedir(const string &s)
 
     // create writable directories if they don't exist
     make_dir(m_homedir);
+#ifdef __LIBRETRO__
+    // the libretro home holds only NVRAM
+    if (m_ramdir.empty())
+        make_dir(m_homedir + "/ram");
+    return;
+#endif
     make_dir(m_homedir + "/logs");
     make_dir(m_homedir + "/midi");
     make_dir(m_homedir + "/fonts");
@@ -138,6 +144,13 @@ string homedir::find_file(string fileName, bool bFallback)
     if (bFallback && !mpo_file_exists(result.c_str())) {
         result = m_appdir + "/" + strFile;
     }
+
+#ifdef __LIBRETRO__
+    if (bFallback && !m_altdir.empty() && !mpo_file_exists(result.c_str())) {
+        string alt = m_altdir + "/" + strFile;
+        if (mpo_file_exists(alt.c_str())) result = alt;
+    }
+#endif
 
     return result;
 }

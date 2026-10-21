@@ -163,10 +163,18 @@ int vldp_open(const char *filename)
     FILE *F    = NULL;
 
     if (p_initialized) {
+#ifdef __LIBRETRO__
+        // Opening a file on a network share can take tens of ms on the game
+        // thread; the VLDP thread opens it anyway and reports a missing file
+        // as STAT_ERROR.
+        (void)F;
+        if (filename) {
+#else
         F = fopen(filename, "rb");
         // if file exists, we can open it
         if (F) {
             fclose(F);
+#endif
             SAFE_STRCPY(g_req_file, filename, sizeof(g_req_file));
             g_req_precache = VLDP_FALSE; // we're not precaching ...
             result         = vldp_cmd(VLDP_REQ_OPEN);

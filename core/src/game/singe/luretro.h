@@ -28,7 +28,13 @@
 #ifndef luretro_h
 #define luretro_h
 
+#ifdef __LIBRETRO__
+#include <stdio.h>
+/* the RAM dir is an absolute save path, which easily passes 128 */
+#define REWRITE_MAXPATH 1024
+#else
 #define REWRITE_MAXPATH 128
+#endif
 
 unsigned char get_espath();
 unsigned char get_zipath();
@@ -37,6 +43,11 @@ int lua_chkdir(const char *path);
 
 const char* get_romdir_path();
 const char* get_ramdir_path();
+#ifdef __LIBRETRO__
+int lua_lr_ramfile(const char *src, char *dst, int dstsize);
+int lua_lr_fopen(const char *filename, const char *mode, FILE **pf,
+                 char *used, int usedsize);
+#endif
 
 void lua_set_espath(unsigned char value);
 void lua_set_zipath(unsigned char value);

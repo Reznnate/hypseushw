@@ -1,0 +1,36 @@
+# reference clones (not submodules) and local test data
+/src/hypseus/
+/src/libretro-daphne/
+/testdata/
+/testhome/
+/testrun/
+/sweep/
+/sweep-*/
+
+# build output
+build*/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.apk
+__pycache__/
+*.pyc
+
+# Android / IDE
+/android/local.properties
+/android/keystore.properties
+*.jks
+*.keystore
+/android/.gradle/
+/android/.idea/
+*.iml
+/android/app/.cxx/
+/android/app/.externalNativeBuild/
+/android/app/build/
+.idea/
+.vscode/
+
+# packaged releases
+/release/

@@ -164,6 +164,19 @@ static int io_open (lua_State *L) {
   const char *mode = luaL_optstring(L, 2, "r");
   char altname[REWRITE_MAXPATH] = {0};
   FILE **pf = newfile(L);
+#ifdef __LIBRETRO__
+  /* writes and saved copies: the RAM dir (see lua_lr_fopen) */
+  if (lua_lr_fopen(filename, mode, pf, altname, REWRITE_MAXPATH))
+    return (*pf == NULL) ? pushresult(L, 0, altname) : 1;
+  altname[0] = 0;
+  *pf = fopen(filename, mode);
+  if (*pf == NULL && get_espath()) {
+    lua_espath(filename, altname, REWRITE_MAXPATH);
+    *pf = fopen(altname, mode);
+    filename = altname;
+  }
+  return (*pf == NULL) ? pushresult(L, 0, filename) : 1;
+#endif
   *pf = fopen(filename, mode);
   if (*pf == NULL) {
     if (get_espath())
@@ -229,6 +242,15 @@ static int g_iofile (lua_State *L, int f, const char *mode) {
 
       } else {
 
+#ifdef __LIBRETRO__
+        /* writes and saved copies: the RAM dir (see lua_lr_fopen) */
+        char lrname[REWRITE_MAXPATH] = {0};
+        if (lua_lr_fopen(filename, mode, pf, lrname, REWRITE_MAXPATH)) {
+          if (*pf == NULL) fileerror(L, 1, lrname);
+        }
+        else
+#endif
+        {
         *pf = fopen(filename, mode);
         if (*pf == NULL) {
           if (get_espath()) {
@@ -238,6 +260,7 @@ static int g_iofile (lua_State *L, int f, const char *mode) {
               if (*pf == NULL) fileerror(L, 1, altname);
           }
           else fileerror(L, 1, filename);
+        }
         }
       }
     }
@@ -290,6 +313,18 @@ static int io_lines (lua_State *L) {
     const char *filename = luaL_checkstring(L, 1);
     char altname[REWRITE_MAXPATH] = {0};
     FILE **pf = newfile(L);
+#ifdef __LIBRETRO__
+    /* a saved copy in the RAM dir wins over the game's own (see io_open) */
+    if (!lua_lr_fopen(filename, "r", pf, altname, REWRITE_MAXPATH)) {
+      altname[0] = 0;
+      *pf = fopen(filename, "r");
+      if (*pf == NULL && get_espath()) {
+        lua_espath(filename, altname, REWRITE_MAXPATH);
+        *pf = fopen(altname, "r");
+        filename = altname;
+      }
+    }
+#else
     *pf = fopen(filename, "r");
     if (*pf == NULL) {
       if (get_espath())
@@ -299,6 +334,7 @@ static int io_lines (lua_State *L) {
       *pf = fopen(altname, "r");
       filename = altname;
     }
+#endif
     if (*pf == NULL)
       fileerror(L, 1, filename);
     aux_lines(L, lua_gettop(L), 1);

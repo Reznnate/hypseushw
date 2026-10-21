@@ -36,6 +36,7 @@
 #include "../game/game.h"
 #include "../hypseus.h"
 #include "../io/conout.h"
+#include "../io/homedir.h"
 #include "../io/mpo_mem.h"
 #include "../io/numstr.h"
 #include "../ldp-out/ldp-vldp.h" // added by JFA for -startsilent
@@ -126,12 +127,18 @@ bool init()
         specDesired.format   = audio_format;
         specDesired.freq     = audio_rate;
 
+#ifdef __LIBRETRO__
+        // no device: the frontend pulls mixed audio with lr_mix()
+        const bool have_output = true;
+#else
         // OpenAudioStream won't allow deviation from specDesired here
         g_audio_device = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
                               &specDesired, StreamAudio, NULL);
+        const bool have_output = g_audio_device != NULL;
+#endif
 
         // if we opened an audio device
-        if (g_audio_device != NULL) {
+        if (have_output) {
             // if we can load all our waves, we're set
             if (load_waves()) {
                 // If we are supposed to start without playing any
@@ -155,8 +162,10 @@ bool init()
 
                 result = g_sound_initialized = true;
 
+#ifndef __LIBRETRO__
                 // enable the audio stream
                 SDL_ResumeAudioStreamDevice(g_audio_device);
+#endif
             }
             // else if loading waves failed
             else {
@@ -242,6 +251,7 @@ int load_waves()
     for (; (i < g_game->get_num_sounds()) && result; i++) {
         filename = "sound/";
         filename += g_game->get_sound_name(i);
+        filename = LR_ASSET(filename);
 
         // initialize so that shutting down succeeds
         g_samples[i].pu8Buf  = NULL;
@@ -272,7 +282,7 @@ int load_waves()
     }
 
     // load "saveme" sound in
-    if (!SDL_LoadWAV("sound/grumble.wav", &spec, &g_sample_saveme.pu8Buf,
+    if (!SDL_LoadWAV(LR_ASSET("sound/grumble.wav").c_str(), &spec, &g_sample_saveme.pu8Buf,
                      &g_sample_saveme.uLength)) {
         LOGW << "Loading 'grumble.wav' failed...";
         result = 0;
@@ -554,6 +564,45 @@ void mixWithMults(Uint8 *stream, int length)
         stream += 4;
     }
 }
+
+#ifdef __LIBRETRO__
+// Produce exactly 'frames' stereo samples for the frontend.  Chips updated
+// every emulated millisecond (update_buffer) already hold most of this; the
+// rest is generated here.  Any surplus is kept for the next call.  At most
+// one chip buffer is mixed; anything past that is silence.
+void lr_mix(int16_t *out, unsigned frames)
+{
+    const unsigned want = frames * BYTES_PER_SAMPLE;
+    unsigned bytes = want;
+
+    if (bytes > g_uSoundChipBufSize)
+        bytes = g_uSoundChipBufSize;
+    if (want > bytes)
+        memset((Uint8 *)out + bytes, 0, want - bytes);
+
+    if (!g_sound_initialized || shutting_down) {
+        memset(out, 0, bytes);
+        return;
+    }
+
+    for (struct chip *cur = g_chip_head; cur; cur = cur->next) {
+        unsigned used = g_uSoundChipBufSize - cur->bytes_left;
+        if (used < bytes)
+            cur->stream_callback(cur->buffer + used, bytes - used, cur->internal_id);
+    }
+
+    g_soundmix_callback((Uint8 *)out, bytes);
+
+    for (struct chip *cur = g_chip_head; cur; cur = cur->next) {
+        unsigned used  = g_uSoundChipBufSize - cur->bytes_left;
+        unsigned carry = used > bytes ? used - bytes : 0;
+        if (carry)
+            memmove(cur->buffer, cur->buffer + bytes, carry);
+        cur->buffer_pointer = cur->buffer + carry;
+        cur->bytes_left     = g_uSoundChipBufSize - carry;
+    }
+}
+#endif
 
 void SDLCALL StreamAudio(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount)
 {

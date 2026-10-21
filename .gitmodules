@@ -1,0 +1,28 @@
+[submodule "src/SDL3"]
+	path = src/SDL3
+	url = https://github.com/libsdl-org/SDL.git
+	shallow = true
+[submodule "src/libogg"]
+	path = src/libogg
+	url = https://github.com/xiph/ogg.git
+	shallow = true
+[submodule "src/libvorbis"]
+	path = src/libvorbis
+	url = https://github.com/xiph/vorbis.git
+	shallow = true
+[submodule "src/libretro-common"]
+	path = src/libretro-common
+	url = https://github.com/libretro/libretro-common.git
+	shallow = true
+[submodule "src/SDL3_ttf"]
+	path = src/SDL3_ttf
+	url = https://github.com/libsdl-org/SDL_ttf.git
+	shallow = true
+[submodule "src/SDL3_image"]
+	path = src/SDL3_image
+	url = https://github.com/libsdl-org/SDL_image.git
+	shallow = true
+[submodule "src/freetype"]
+	path = src/freetype
+	url = https://github.com/freetype/freetype.git
+	shallow = true

@@ -52,6 +52,13 @@ static int os_execute (lua_State *L) {
 
 static int os_remove (lua_State *L) {
   const char *filename = luaL_checkstring(L, 1);
+#ifdef __LIBRETRO__
+  /* only files the game saved, in the RAM dir (see lua_lr_fopen);
+     lua_lr_ramfile sets errno for the refusal message */
+  char ram[REWRITE_MAXPATH];
+  if (lua_lr_ramfile(filename, ram, sizeof(ram))) filename = ram;
+  else return os_pushresult(L, 0, filename);
+#endif
   return os_pushresult(L, remove(filename) == 0, filename);
 }
 
@@ -59,6 +66,16 @@ static int os_remove (lua_State *L) {
 static int os_rename (lua_State *L) {
   const char *fromname = luaL_checkstring(L, 1);
   const char *toname = luaL_checkstring(L, 2);
+#ifdef __LIBRETRO__
+  /* within the RAM dir only, as os.remove */
+  char ramfrom[REWRITE_MAXPATH], ramto[REWRITE_MAXPATH];
+  if (lua_lr_ramfile(fromname, ramfrom, sizeof(ramfrom)) &&
+      lua_lr_ramfile(toname, ramto, sizeof(ramto))) {
+    fromname = ramfrom;
+    toname = ramto;
+  }
+  else return os_pushresult(L, 0, fromname);
+#endif
   return os_pushresult(L, rename(fromname, toname) == 0, fromname);
 }
 

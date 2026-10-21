@@ -39,6 +39,13 @@ class homedir
     string find_file(string fileName, bool bFallback = true);
     string find_romfile(string fileName, bool bFallback = true);
 
+#ifdef __LIBRETRO__
+    // Read-only asset locations (pics/, sound/) searched after the home
+    // directory: the core's system folder, then the user's Daphne folder.
+    void set_appdir(const string &s) { m_appdir = s; }
+    void set_altdir(const string &s) { m_altdir = s; }
+#endif
+
   private:
     void make_dir(const string &dir);
 
@@ -48,9 +55,21 @@ class homedir
     string m_homedir; //"Home" directory to search first (defaults to appdir)
     string m_romdir; // ROMS directory
     string m_ramdir; // RAM directory
+#ifdef __LIBRETRO__
+    string m_altdir;
+#endif
 };
 
 extern homedir g_homedir; // our global game class.  Instead of having every
                           // .cpp file define this, we put it here.
+
+// Path of a read-only asset (e.g. "pics/led0.bmp").  Upstream resolves these
+// relative to the current directory, which is the game's folder (batch and
+// Singe games) or the frontend's; the core's assets are in its system folder.
+#ifdef __LIBRETRO__
+#define LR_ASSET(p) g_homedir.find_file(p, true)
+#else
+#define LR_ASSET(p) string(p)
+#endif
 
 #endif

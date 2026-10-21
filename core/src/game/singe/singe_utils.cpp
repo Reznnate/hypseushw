@@ -32,6 +32,29 @@ bool net_send_enabled();
 
 extern "C" {
 
+#ifdef __LIBRETRO__
+// Read again on each call: the core runs one game after another in the same
+// process, each with its own directories.  The pointer stays valid until
+// the next call; the Lua code uses it straight away.
+const char* get_romdir_path()
+{
+    static std::string romdir;
+    romdir = g_homedir.get_romdir();
+    if (romdir.empty()) romdir = "roms";
+
+    return romdir.c_str();
+}
+
+const char* get_ramdir_path()
+{
+    static std::string dir;
+    dir = g_homedir.get_ramdir();
+    if (dir.empty()) dir = "ram";
+    dir += "/";
+
+    return dir.c_str();
+}
+#else
 const char* get_romdir_path()
 {
     static std::string romdir = g_homedir.get_romdir();
@@ -50,6 +73,7 @@ const char* get_ramdir_path()
 
     return dir.c_str();
 }
+#endif
 
 unsigned char socket_disabled()
 {

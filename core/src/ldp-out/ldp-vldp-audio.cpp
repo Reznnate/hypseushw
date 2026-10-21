@@ -36,6 +36,7 @@
 #include "../io/mpo_fileio.h"
 #include "../sound/sound.h"
 #include "../timer/timer.h"
+#include "../vldp/vldp_mp4.h"
 #include <plog/Log.h>
 
 #ifdef DEBUG
@@ -47,6 +48,16 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <mutex>
+#ifdef __LIBRETRO__
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <set>
+#include <thread>
+#include <vector>
+#endif
 
 #include <vorbis/codec.h> // OGG VORBIS specific headers
 #include <vorbis/vorbisfile.h>
@@ -73,6 +84,11 @@ std::mutex g_LDPMutex;
 SDL_Mutex *g_ogg_mutex   = NULL;
 mpo_io *g_pIOAudioHandle = NULL;
 OggVorbis_File s_ogg;
+#ifdef VLDP_MP4
+static bool s_mp4_audio = false; // the sound comes from an MP4 video file
+#else
+static const bool s_mp4_audio = false;
+#endif
 
 Uint32 g_audio_filesize = 0;      // total size of the audio stream
 Uint32 g_audio_filepos  = 0;      // the position in the file of our audio stream
@@ -174,6 +190,160 @@ int mmseek(void *datasource, int64_t offset, int whence)
     return result;
 }
 
+#ifdef __LIBRETRO__
+// Soundtracks are read whole into RAM when a video file is opened, which on a
+// network share stalls the game thread for a few hundred ms.  They are read
+// ahead on a background thread as soon as the framefile is parsed, and kept
+// for the rest of the session so reopening one is instant.
+namespace {
+typedef std::shared_ptr<std::vector<Uint8>> ogg_buf;
+std::mutex s_pf_mutex;
+std::condition_variable s_pf_cv; // a soundtrack finished loading
+std::map<std::string, ogg_buf> s_pf_done;
+std::set<std::string> s_pf_pending;
+std::thread s_pf_thread;
+// audio_shutdown() joins it; on an exit without unload, let it go rather
+// than abort in std::thread's destructor
+struct pf_thread_guard {
+    ~pf_thread_guard() { if (s_pf_thread.joinable()) s_pf_thread.detach(); }
+} s_pf_thread_guard;
+bool s_pf_abort = false;
+ogg_buf s_cur_ogg; // owns g_big_buf when it came from the prefetch
+mpo_io s_prefetched_io; // stands in for the file handle then: no file access
+
+// Soundtrack file names by video directory, video name and alternate-audio
+// suffix (game thread only).  Filled when the framefile is parsed, so
+// opening a video later checks no file on the game thread.
+std::map<std::string, std::string> s_ogg_names;
+}
+
+// The soundtrack for video 'm2v' in 'dir': the alternate one for 'suffix'
+// when the game has it, else the video's own (a game set up for a soundtrack
+// it doesn't have plays its own).  Relative to 'dir'.
+static std::string soundtrack_name(const std::string &dir, const std::string &m2v, const std::string &suffix)
+{
+    const std::string stem = m2v.substr(0, m2v.length() - 4);
+    if (suffix.empty()) return stem + ".ogg";
+
+    const std::string key = dir + '\n' + m2v + '\n' + suffix;
+    auto it = s_ogg_names.find(key);
+    if (it != s_ogg_names.end()) return it->second;
+    std::string name = stem + suffix + ".ogg";
+    if (!mpo_file_exists((dir + name).c_str())) name = stem + ".ogg";
+    s_ogg_names[key] = name;
+    return name;
+}
+
+static void prefetch_stop()
+{
+    {
+        std::lock_guard<std::mutex> l(s_pf_mutex);
+        s_pf_abort = true;
+    }
+    if (s_pf_thread.joinable()) s_pf_thread.join();
+
+    std::lock_guard<std::mutex> l(s_pf_mutex);
+    s_pf_abort = false;
+    s_pf_pending.clear();
+    s_pf_done.clear();
+    s_ogg_names.clear();
+}
+
+static void prefetch_worker(std::vector<std::string> paths)
+{
+    for (const auto &p : paths)
+    {
+        const Uint64 start = SDL_GetTicksNS();
+        ogg_buf buf;
+        bool aborted = false;
+        if (FILE *f = fopen(p.c_str(), "rb"))
+        {
+            buf = std::make_shared<std::vector<Uint8>>();
+            std::vector<Uint8> &v = *buf;
+            const size_t chunk = 1 << 20;
+            size_t n;
+            do
+            {
+                {
+                    std::lock_guard<std::mutex> l(s_pf_mutex);
+                    aborted = s_pf_abort;
+                }
+                if (aborted) break;
+                v.resize(v.size() + chunk);
+                n = fread(&v[v.size() - chunk], 1, chunk, f);
+                v.resize(v.size() - chunk + n);
+            } while (n == chunk);
+            fclose(f);
+        }
+
+        if (buf && !aborted) {
+            LOGI << fmt("Read %s (%.1f MB) in %.0f ms", p.c_str(), buf->size() / 1048576.0,
+                        (SDL_GetTicksNS() - start) / 1e6);
+        }
+
+        {
+            std::lock_guard<std::mutex> l(s_pf_mutex);
+            if (buf && !s_pf_abort) s_pf_done[p] = buf;
+            s_pf_pending.erase(p);
+            aborted = s_pf_abort;
+        }
+        s_pf_cv.notify_all();
+        if (aborted) return;
+    }
+}
+
+void ldp_vldp::prefetch_audio()
+{
+    prefetch_stop();
+
+    std::vector<std::string> paths;
+    for (unsigned int i = 0; i < m_file_index; ++i)
+    {
+        const string &name = m_mpeginfo[i].name;
+        if (name.length() < 4) continue;
+#ifdef VLDP_MP4
+        if (mp4::handles(name.c_str())) continue; // its sound is in the video file
+#endif
+        const string p = m_mpeg_path + soundtrack_name(m_mpeg_path, name, m_altaudio_suffix);
+        if (std::find(paths.begin(), paths.end(), p) == paths.end()) paths.push_back(p);
+    }
+
+    std::lock_guard<std::mutex> l(s_pf_mutex);
+    s_pf_pending.insert(paths.begin(), paths.end());
+    s_pf_thread = std::thread(prefetch_worker, paths);
+}
+
+// The prefetched copy of 'path', or nothing if it was not prefetched.  If it
+// is still being read this waits for it, a millisecond at a time:
+// SDL_Delay(0) is the core's lr_delay(0), which hands the frame back to the
+// frontend once the engine's time for it is used up, so the wait never holds
+// up the frontend.
+static ogg_buf prefetched(const std::string &path)
+{
+    std::unique_lock<std::mutex> l(s_pf_mutex);
+    if (s_pf_pending.count(path)) {
+        LOGI << "Waiting for the soundtrack to finish loading";
+    }
+    while (s_pf_pending.count(path))
+    {
+        s_pf_cv.wait_for(l, std::chrono::milliseconds(1));
+        if (!s_pf_pending.count(path)) break;
+        l.unlock();
+        SDL_Delay(0);
+        l.lock();
+    }
+    auto it = s_pf_done.find(path);
+    return it == s_pf_done.end() ? ogg_buf() : it->second;
+}
+
+static void free_big_buf()
+{
+    if (s_cur_ogg) s_cur_ogg.reset();
+    else delete[] g_big_buf;
+    g_big_buf = NULL;
+}
+#endif
+
 int mmclose(void *datasource)
 {
     // safety check
@@ -188,10 +358,17 @@ int mmclose(void *datasource)
 #else
     LOGD << "Freeing memory used to store audio stream...";
     // free(datasource);
+#ifdef __LIBRETRO__
+    free_big_buf();
+#else
     delete[] g_big_buf;
     g_big_buf = NULL;
 #endif
+#endif
 
+#ifdef __LIBRETRO__
+    if (g_pIOAudioHandle != &s_prefetched_io)
+#endif
     mpo_close(g_pIOAudioHandle);
     g_pIOAudioHandle = NULL;
 
@@ -340,12 +517,20 @@ bool ldp_vldp::switch_altaudio(const char* suffix)
 // soundtrack if needed)
 void ldp_vldp::oggize_path(string &oggpath, string m2vpath)
 {
+#ifdef VLDP_MP4
+    // MP4 video has its sound in the same file
+    if (mp4::handles(m2vpath.c_str())) { oggpath = m_oggpath = m2vpath; return; }
+#endif
     oggpath = m_oggpath = m2vpath;
     oggpath.replace(oggpath.length() - 4, 4,
                     m_altaudio_suffix); // append optional alternate audio
                                         // suffix (if this string is blank it
                                         // should be ok)
     oggpath += ".ogg";
+#ifdef __LIBRETRO__
+    // a game set up for a soundtrack it doesn't have plays its own
+    oggpath = soundtrack_name(m_mpeg_path, m2vpath, m_altaudio_suffix);
+#endif
 }
 
 // initializes VLDP audio, returns 1 on success or 0 on failure
@@ -372,9 +557,13 @@ bool ldp_vldp::audio_init()
 void ldp_vldp::audio_shutdown()
 {
     // if we have an audio file still open, close it
-    if (g_pIOAudioHandle != 0) {
+    if (g_pIOAudioHandle != 0 || s_mp4_audio) {
         close_audio_stream();
     }
+
+#ifdef __LIBRETRO__
+    prefetch_stop();
+#endif
 
     // if we successfully created a mutex previously, then destroy it now
     if (g_ogg_mutex) {
@@ -389,6 +578,14 @@ void ldp_vldp::close_audio_stream()
 
     g_audio_ready   = false;
     g_audio_playing = false;
+#ifdef VLDP_MP4
+    if (s_mp4_audio) {
+        mp4audio::close();
+        s_mp4_audio = false;
+        OGG_UNLOCK;
+        return;
+    }
+#endif
     ov_clear(&s_ogg);
 
     OGG_UNLOCK;
@@ -402,13 +599,35 @@ bool ldp_vldp::open_audio_stream(const string &strFilename)
     OGG_LOCK; // can't have audio callback running during this
 
     // if an audio stream is already open, close it first
-    if (g_pIOAudioHandle != 0) {
+    if (g_pIOAudioHandle != 0 || s_mp4_audio) {
         close_audio_stream();
     }
 
     mmreset(); // reset the mm wrappers for new use
 
+#ifdef VLDP_MP4
+    if (mp4::handles(strFilename.c_str())) {
+        // opened on the audio thread; a track that cannot be opened is
+        // logged there and plays as silence
+        mp4audio::open((m_mpeg_path + strFilename).c_str());
+        s_mp4_audio = true;
+        g_audio_ready = true;
+        OGG_UNLOCK;
+        return true;
+    }
+#endif
+
+#ifdef __LIBRETRO__
+    // the prefetched copy needs no file access on this (the game's) thread
+    s_cur_ogg = prefetched(m_mpeg_path + strFilename);
+    if (s_cur_ogg) {
+        s_prefetched_io.size = s_cur_ogg->size();
+        g_pIOAudioHandle = &s_prefetched_io;
+    } else
+        g_pIOAudioHandle = mpo_open((m_mpeg_path + strFilename).c_str(), MPO_OPEN_READONLY);
+#else
     g_pIOAudioHandle = mpo_open((m_mpeg_path + strFilename).c_str(), MPO_OPEN_READONLY);
+#endif
     // if audio file was opened successfully
     if (g_pIOAudioHandle) {
         g_audio_filesize = static_cast<unsigned int>(g_pIOAudioHandle->size & 0xFFFFFFFF);
@@ -419,6 +638,15 @@ bool ldp_vldp::open_audio_stream(const string &strFilename)
             LOGE << "mmap failed";
         }
 #else
+#ifdef __LIBRETRO__
+        if (s_cur_ogg) {
+            g_big_buf = s_cur_ogg->data();
+        } else {
+            g_big_buf = new unsigned char[g_audio_filesize];
+            mpo_read(g_big_buf, g_audio_filesize, NULL,
+                     g_pIOAudioHandle); // read entire stream into RAM
+        }
+#else
         g_big_buf = new unsigned char[g_audio_filesize];
         if (g_big_buf) {
             mpo_read(g_big_buf, g_audio_filesize, NULL,
@@ -426,6 +654,7 @@ bool ldp_vldp::open_audio_stream(const string &strFilename)
         } else {
             LOGE << "out of memory";
         }
+#endif
 #endif
         if (g_big_buf) {
             int open_result = ov_open_callbacks(g_big_buf, &s_ogg, NULL, 0, mycallbacks);
@@ -462,6 +691,9 @@ bool ldp_vldp::open_audio_stream(const string &strFilename)
 
         // close file if we got an earlier error
         if (!result) {
+#ifdef __LIBRETRO__
+            if (g_pIOAudioHandle != &s_prefetched_io)
+#endif
             mpo_close(g_pIOAudioHandle);
             g_pIOAudioHandle = NULL;
 
@@ -469,6 +701,8 @@ bool ldp_vldp::open_audio_stream(const string &strFilename)
             if (g_big_buf) {
 #ifdef TRY_MMAP
                 munmap(g_big_buf, g_audio_filesize);
+#elif defined(__LIBRETRO__)
+                free_big_buf();
 #else
                 delete[] g_big_buf;
 #endif
@@ -499,8 +733,12 @@ bool ldp_vldp::seek_audio(Uint64 u64Samples)
 
         OGG_LOCK; // can't have audio callback running during this
 
-        if (ov_seekable(&s_ogg))
+        if (s_mp4_audio || ov_seekable(&s_ogg))
         {
+#ifdef VLDP_MP4
+            if (s_mp4_audio) mp4audio::seek(u64Samples);
+            else
+#endif
             ov_pcm_seek(&s_ogg, u64Samples);
             g_audio_playing = false; // audio should not be playing immediately
                                      // after a seek
@@ -631,6 +869,11 @@ void ldp_vldp_audio_callback(Uint8 *stream, int len, int unused)
             // -------------------------------------------------------------
             while (samples_copied < len)
             {
+#ifdef VLDP_MP4
+                if (s_mp4_audio)
+                    samples_read = mp4audio::read((uint8_t *)&g_small_buf[0], AUDIO_BUF_CHUNK);
+                else
+#endif
                 samples_read = ov_read(&s_ogg, &g_small_buf[0], AUDIO_BUF_CHUNK, 0, 2, 1, &nop);
 
                 if (samples_read > 0)

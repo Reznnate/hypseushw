@@ -96,6 +96,10 @@ void          sep_error(const char *fmt, ...);
 int           sep_lua_error(lua_State *L);
 int           sep_prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
                            int Ypitch, int Upitch, int Vpitch);
+#ifdef __LIBRETRO__
+int           sep_prepare_frame_nv12_callback(const uint8_t *Yplane, int Ypitch,
+                                              const uint8_t *UVplane, int UVpitch);
+#endif
 void          sep_print(const char *fmt, ...);
 void          sep_release_vldp();
 void          sep_set_static_pointers(double *m_disc_fps, unsigned int *m_uDiscFPKS);

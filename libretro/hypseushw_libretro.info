@@ -1,0 +1,34 @@
+# Software Information
+display_name = "Arcade (Daphne HypseusHW)"
+authors = "Matt Ownby|DirtBagXon|HypseusHW contributors"
+supported_extensions = "zip|txt|bat"
+corename = "Daphne (HypseusHW)"
+categories = "Emulator"
+license = "GPLv3"
+permissions = ""
+display_version = "0.1.0"
+
+# Hardware Information
+manufacturer = "Various"
+systemname = "Laserdisc Arcade"
+systemid = "daphne"
+
+# Libretro Features
+database = "Daphne"
+supports_no_game = "false"
+savestate = "false"
+cheats = "false"
+input_descriptors = "true"
+memory_descriptors = "false"
+libretro_saves = "false"
+core_options = "true"
+load_subsystem = "false"
+hw_render = "true"
+needs_fullpath = "true"
+disk_control = "false"
+is_experimental = "true"
+needs_kbd_mouse_focus = "false"
+
+firmware_count = 0
+
+description = "Laserdisc arcade emulator built on Hypseus Singe (a Daphne fork), 64-bit with audio, GPU rendering (Vulkan or OpenGL) and hardware video decoding on Android. Plays daphne.exe data: launch roms/<game>.zip or framefile/<game>.txt. Also plays Singe 1 and Singe 2 games (Singe 2 MP4 video as it is) through the RocketLauncher batch file beside framefile/. No BIOS needed."

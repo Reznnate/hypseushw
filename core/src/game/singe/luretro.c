@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __LIBRETRO__
+#include <errno.h>
+#endif
 
 #ifdef _WIN32
 #include <direct.h>
@@ -70,7 +73,8 @@ int lua_mkdir(const char *path)
     struct stat st = {0};
 
     if (stat(path, &st) == -1) {
-        if (mkdir(path, 0755) != 0) {
+        /* EEXIST: a drive root ("C:") fails stat but exists */
+        if (mkdir(path, 0755) != 0 && errno != EEXIST) {
             return -1;
         }
     }
@@ -202,8 +206,106 @@ void lua_rampath(const char *src, char *dst, int dstsize)
         rem--;
     }
 
+#ifdef __LIBRETRO__
+    /* a shortened name would be a different file: fail instead */
+    if (*src) {
+        dst[0] = '\0';
+        return;
+    }
+#endif
     *out = '\0';
 }
+
+#ifdef __LIBRETRO__
+static int lr_has_parent_ref(const char *p)
+{
+    for (;;) {
+        const char *e = p;
+        while (*e && *e != '/' && *e != '\\') e++;
+        if (e - p == 2 && p[0] == '.' && p[1] == '.') return 1;
+        if (!*e) return 0;
+        p = e + 1;
+    }
+}
+
+/* The game data stays read-only in the libretro core: files a game writes
+ * live under the RAM dir (the frontend's save folder), and reads look there
+ * first.  Fills dst and returns 1 for a relative path that stays inside the
+ * RAM dir; returns 0 with errno set for an absolute path, a ".." segment or
+ * a name too long for dst. */
+int lua_lr_ramfile(const char *src, char *dst, int dstsize)
+{
+    dst[0] = '\0';
+    if (!src || src[0] == '/' || src[0] == '\\' || (src[0] && src[1] == ':') ||
+        lr_has_parent_ref(src)) {
+        errno = EACCES;
+        return 0;
+    }
+    lua_rampath(src, dst, dstsize);
+    if (dst[0] == '\0') {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    return 1;
+}
+
+static int lr_copy_file(const char *from, const char *to)
+{
+    char buf[16384];
+    size_t n;
+    int ok = 1;
+    FILE *in = fopen(from, "rb"), *out;
+
+    if (!in) return 0;
+    out = fopen(to, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) remove(to);
+    return ok;
+}
+
+/* Opens a file the way io.open, io.input/io.output and io.lines do here.
+ * Writes ("w", "a" or any "+" mode) only go to the RAM dir; anything else is
+ * refused with EACCES.  "r+" on a file the game ships but has not saved yet
+ * starts from a copy of the shipped file, so updating it in place works
+ * without touching the game's folder.  Returns 1 when the open is decided
+ * (*pf, or NULL with errno set; used names the path for the error), or 0
+ * for a read the RAM dir has no copy of: the caller then reads the game's
+ * own file as upstream does. */
+int lua_lr_fopen(const char *filename, const char *mode, FILE **pf,
+                 char *used, int usedsize)
+{
+    int ram = lua_lr_ramfile(filename, used, usedsize);
+
+    *pf = NULL;
+    if (!strpbrk(mode, "wa+")) {
+        if (ram) *pf = fopen(used, mode);
+        if (*pf) return 1;
+        snprintf(used, usedsize, "%s", filename);
+        return 0;
+    }
+
+    if (!ram) {
+        int err = errno;
+        snprintf(used, usedsize, "%s", filename);
+        errno = err;
+        return 1;
+    }
+    if (lua_chkdir(used) != 0) return 1;
+    if (mode[0] == 'r') {
+        struct stat st;
+        if (stat(used, &st) != 0) lr_copy_file(filename, used);
+    }
+    *pf = fopen(used, mode);
+    return 1;
+}
+#endif
 
 int lua_chkdir(const char *path)
 {

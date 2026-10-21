@@ -23,6 +23,15 @@ if( HAVE_DEPRECATED_NON_PROTOTYPE )
     string( APPEND LIBMPEG2_CFLAGS " -Wno-deprecated-non-prototype" )
 endif()
 
+# -DLIBMPEG2_PREBUILT=ON reuses a libmpeg2 built out-of-band into
+# 3rdparty/ of the build tree (Ninja on Windows cannot run the autotools steps)
+option( LIBMPEG2_PREBUILT "Use an already built 3rdparty/lib/libmpeg2.a" OFF )
+if( LIBMPEG2_PREBUILT )
+    if( NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/lib/libmpeg2.a )
+        message( FATAL_ERROR "LIBMPEG2_PREBUILT: ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/lib/libmpeg2.a not found" )
+    endif()
+    add_custom_target( libmpeg2 )
+else()
 externalproject_add( libmpeg2
 	PREFIX ${CMAKE_CURRENT_BINARY_DIR}/3rdparty
 	URL ../../../src/3rdparty/libmpeg2/libmpeg2-master.tgz
@@ -51,6 +60,7 @@ ExternalProject_Add_Step( libmpeg2 bootstrap
 	DEPENDEES download
 	DEPENDERS configure
 )
+endif()
 
 set( MPEG2_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/include/mpeg2dec )
 set( MPEG2_LIBRARIES ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/lib/libmpeg2.a )

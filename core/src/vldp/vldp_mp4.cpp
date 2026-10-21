@@ -1,0 +1,960 @@
+/*
+ * MP4 laserdisc video for Singe 2 games.  See vldp_mp4.h.
+ *
+ * The platform part (MediaCodec or Media Foundation) demuxes and decodes;
+ * this part numbers the pictures, drops the ones before a search target,
+ * and keeps the audio track decoded ahead of the game.
+ *
+ * Copyright (C) 2026 HypseusHW contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+#include "vldp_mp4.h"
+
+#ifdef VLDP_MP4
+
+#include "vldp.h" // g_lr_vldp_hwdec: off with the CPU Fallback core option
+
+#include <math.h>
+#include <string.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <plog/Log.h>
+
+#include "../io/conout.h"
+
+#ifdef __ANDROID__
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaFormat.h>
+
+#include "vldp_mediacodec.h"
+#else
+#include <windows.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#endif
+
+namespace {
+
+std::string base_name(const char *file)
+{
+    const char *b = strrchr(file, '/');
+    const char *b2 = strrchr(file, '\\');
+    if (b2 > b) b = b2;
+    return b ? b + 1 : file;
+}
+
+// One picture from the platform decoder.  Its pixels stay valid until
+// video_release() (or the next video_next()/video_seek()).
+struct decoded
+{
+    vldp_picture pic;
+    int64_t pts_us;
+};
+
+// ---------------------------------------------------------------------------
+// Platform decoders
+// ---------------------------------------------------------------------------
+
+#ifdef __ANDROID__
+
+// Frames per second from the median step between picture times, which are
+// whole microseconds: snapped to the usual rates.  0 if unusable.
+double rate_from_step(int64_t step)
+{
+    if (step <= 0) return 0;
+    static const double rates[] = {24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 50, 60000.0 / 1001, 60};
+    double best = 1e6 / step;
+    for (double r : rates)
+        if (fabs(1e6 / r - step) < 2) best = r;
+    return best;
+}
+
+// Android's software video decoders, for CPU Fallback: by MIME type, newest
+// first.
+AMediaCodec *software_decoder(const char *mime)
+{
+    static const char *const names[][3] = {
+        {"video/avc", "c2.android.avc.decoder", "OMX.google.h264.decoder"},
+        {"video/hevc", "c2.android.hevc.decoder", "OMX.google.hevc.decoder"},
+    };
+    for (const auto &n : names)
+    {
+        if (strcmp(mime, n[0]) != 0) continue;
+        for (int i = 1; i < 3; ++i)
+            if (AMediaCodec *c = AMediaCodec_createCodecByName(n[i])) return c;
+    }
+    return nullptr;
+}
+
+// A track of the file, with its extractor and decoder.
+struct track
+{
+    int fd = -1;
+    AMediaExtractor *ex = nullptr;
+    AMediaCodec *codec = nullptr;
+    AMediaFormat *format = nullptr; // the track's format
+    std::string codec_name;
+    bool video = false;
+    bool in_eos = false, out_eos = false;
+    ssize_t out_index = -1;          // output buffer held by the caller
+
+    // video output layout
+    mediacodec::layout layout;
+    int w = 0, h = 0;
+    // audio output
+    int32_t rate = 0, channels = 0;
+
+    bool open(const char *file, const char *kind)
+    {
+        video = strcmp(kind, "video/") == 0;
+        fd = ::open(file, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { LOGE << fmt("MP4: could not open %s", file); return false; }
+        struct stat st;
+        ex = fstat(fd, &st) == 0 ? AMediaExtractor_new() : nullptr;
+        if (!ex || AMediaExtractor_setDataSourceFd(ex, fd, 0, st.st_size) != AMEDIA_OK)
+        {
+            LOGE << fmt("MP4: %s is not a file MediaExtractor can read", file);
+            return false;
+        }
+        const size_t n = AMediaExtractor_getTrackCount(ex);
+        for (size_t i = 0; i < n; ++i)
+        {
+            AMediaFormat *f = AMediaExtractor_getTrackFormat(ex, i);
+            const char *mime = nullptr;
+            if (AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &mime) && mime &&
+                strncmp(mime, kind, strlen(kind)) == 0)
+            {
+                AMediaExtractor_selectTrack(ex, i);
+                format = f;
+                // video on the CPU with CPU Fallback, else the device's
+                // choice (its hardware decoder)
+                if (video && !g_lr_vldp_hwdec) codec = software_decoder(mime);
+                if (!codec) codec = AMediaCodec_createDecoderByType(mime);
+                if (!codec) { LOGE << fmt("MP4: no decoder for %s", mime); return false; }
+                codec_name = mediacodec::codec_name(codec);
+                media_status_t s;
+                if (video)
+                {
+                    AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_WIDTH, &w);
+                    AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_HEIGHT, &h);
+                    s = mediacodec::configure_video(codec, f);
+                }
+                else
+                    s = AMediaCodec_configure(codec, f, nullptr, nullptr, 0);
+                if (s == AMEDIA_OK) s = AMediaCodec_start(codec);
+                if (s != AMEDIA_OK)
+                {
+                    LOGE << fmt("MP4: %s would not start (%d)", codec_name.c_str(), (int)s);
+                    return false;
+                }
+                return true;
+            }
+            AMediaFormat_delete(f);
+        }
+        LOGE << fmt("MP4: %s has no %s track", file, kind);
+        return false;
+    }
+
+    void close()
+    {
+        if (codec)
+        {
+            if (out_index >= 0) AMediaCodec_releaseOutputBuffer(codec, out_index, false);
+            AMediaCodec_stop(codec);
+            AMediaCodec_delete(codec);
+        }
+        if (format) AMediaFormat_delete(format);
+        if (ex) AMediaExtractor_delete(ex);
+        if (fd >= 0) ::close(fd);
+        *this = track();
+    }
+
+    void seek(int64_t us)
+    {
+        if (out_index >= 0) { AMediaCodec_releaseOutputBuffer(codec, out_index, false); out_index = -1; }
+        AMediaExtractor_seekTo(ex, us, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+        AMediaCodec_flush(codec);
+        in_eos = out_eos = false;
+    }
+
+    // Sends the next sample to the decoder, if it has room.  A sample that
+    // cannot be read ends the stream there.
+    void feed(int64_t timeout_us)
+    {
+        if (in_eos) return;
+        const ssize_t in = AMediaCodec_dequeueInputBuffer(codec, timeout_us);
+        if (in < 0) return;
+        size_t cap = 0;
+        uint8_t *b = AMediaCodec_getInputBuffer(codec, in, &cap);
+        const ssize_t n = b ? AMediaExtractor_readSampleData(ex, b, cap) : -1;
+        if (n < 0)
+        {
+            const int64_t t = AMediaExtractor_getSampleTime(ex);
+            if (t >= 0)
+            {
+                LOGE << fmt("MP4: could not read the %s sample at %.3f s, ending the stream there",
+                            video ? "video" : "audio", t / 1e6);
+            }
+            AMediaCodec_queueInputBuffer(codec, in, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+            in_eos = true;
+            return;
+        }
+        AMediaCodec_queueInputBuffer(codec, in, 0, n, AMediaExtractor_getSampleTime(ex), 0);
+        AMediaExtractor_advance(ex);
+    }
+
+    void read_output_format()
+    {
+        if (video)
+        {
+            mediacodec::read_output_format(codec, &layout, "MP4");
+            return;
+        }
+        AMediaFormat *f = AMediaCodec_getOutputFormat(codec);
+        if (!f) return;
+        int32_t v;
+        if (AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, &v) && v > 0) rate = v;
+        if (AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &v) && v > 0) channels = v;
+        AMediaFormat_delete(f);
+    }
+
+    // The next output buffer: 1 with it in 'data', 0 at the end of the
+    // stream, -1 if none came within 'timeout_us'.
+    int next(const uint8_t **data, size_t *size, int64_t *pts_us, int64_t timeout_us)
+    {
+        if (out_index >= 0) { AMediaCodec_releaseOutputBuffer(codec, out_index, false); out_index = -1; }
+        for (;;)
+        {
+            if (out_eos) return 0;
+            feed(0);
+            AMediaCodecBufferInfo bi;
+            const ssize_t o = AMediaCodec_dequeueOutputBuffer(codec, &bi, in_eos ? timeout_us : 0);
+            if (o == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) { read_output_format(); continue; }
+            if (o == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+            if (o < 0)
+            {
+                if (in_eos) return -1;
+                // let the decoder work on what it has, then look again
+                feed(timeout_us);
+                const ssize_t o2 = AMediaCodec_dequeueOutputBuffer(codec, &bi, 0);
+                if (o2 == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) { read_output_format(); continue; }
+                if (o2 < 0) return -1;
+                return take(o2, bi, data, size, pts_us);
+            }
+            return take(o, bi, data, size, pts_us);
+        }
+    }
+
+    int take(ssize_t o, const AMediaCodecBufferInfo &bi, const uint8_t **data, size_t *size, int64_t *pts_us)
+    {
+        if (bi.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) out_eos = true;
+        size_t cap = 0;
+        uint8_t *b = bi.size > 0 ? AMediaCodec_getOutputBuffer(codec, o, &cap) : nullptr;
+        if (!b)
+        {
+            AMediaCodec_releaseOutputBuffer(codec, o, false);
+            return out_eos ? 0 : -1;
+        }
+        out_index = o;
+        *data = b + bi.offset;
+        *size = bi.size;
+        *pts_us = bi.presentationTimeUs;
+        return 1;
+    }
+};
+
+track s_video;
+
+bool video_open(const char *file, mp4::stream_info *info, int64_t *start_us, std::string *decoder)
+{
+    if (!s_video.open(file, "video/")) { s_video.close(); return false; }
+    *decoder = s_video.codec_name;
+
+    int64_t duration = 0;
+    if (!AMediaFormat_getInt64(s_video.format, AMEDIAFORMAT_KEY_DURATION, &duration)) duration = 0;
+    int32_t fps = 0;
+    double rate = 0;
+    if (AMediaFormat_getInt32(s_video.format, AMEDIAFORMAT_KEY_FRAME_RATE, &fps) && fps > 0) rate = fps;
+    int32_t sar_w = 0, sar_h = 0;
+    AMediaFormat_getInt32(s_video.format, "sar-width", &sar_w);
+    AMediaFormat_getInt32(s_video.format, "sar-height", &sar_h);
+
+    // The frame rate from the sample times (exact, unlike the format's
+    // rounded value), and where the stream starts.
+    std::vector<int64_t> times;
+    for (int i = 0; i < 120; ++i)
+    {
+        const int64_t t = AMediaExtractor_getSampleTime(s_video.ex);
+        if (t < 0) break;
+        times.push_back(t);
+        AMediaExtractor_advance(s_video.ex);
+    }
+    std::sort(times.begin(), times.end());
+    *start_us = times.empty() ? 0 : times[0];
+    if (times.size() > 10)
+    {
+        std::vector<int64_t> d;
+        for (size_t i = 1; i < times.size(); ++i) d.push_back(times[i] - times[i - 1]);
+        std::sort(d.begin(), d.end());
+        const double r = rate_from_step(d[d.size() / 2]);
+        if (r > 0) rate = r;
+    }
+    if (rate <= 0) rate = 30000.0 / 1001;
+    AMediaExtractor_seekTo(s_video.ex, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+
+    if (s_video.w <= 0 || s_video.h <= 0 || duration <= *start_us)
+    {
+        LOGE << fmt("MP4: %s has no picture size or no length", file);
+        s_video.close();
+        return false;
+    }
+    info->w = s_video.w;
+    info->h = s_video.h;
+    info->sar_num = sar_w > 0 && sar_h > 0 ? sar_w : 1;
+    info->sar_den = sar_w > 0 && sar_h > 0 ? sar_h : 1;
+    info->fpks = (uint32_t)(rate * 1000 + 0.5);
+    info->frames = (uint32_t)((double)(duration - *start_us) * rate / 1e6 + 0.5);
+    return true;
+}
+
+void video_close() { s_video.close(); }
+void video_seek(int64_t us) { s_video.seek(us); }
+
+int video_next(decoded *out)
+{
+    const uint8_t *b;
+    size_t size;
+    int r = s_video.next(&b, &size, &out->pts_us, 10000);
+    if (r <= 0) return r;
+    return mediacodec::describe(s_video.layout, s_video.w, s_video.h, b, size, &out->pic) ? 1 : -1;
+}
+
+// MediaCodec takes the buffer back on the next next() or seek()
+void video_release() {}
+
+track s_audio;
+
+bool audio_open(const char *file, int *rate, int *channels)
+{
+    if (!s_audio.open(file, "audio/")) { s_audio.close(); return false; }
+    AMediaFormat_getInt32(s_audio.format, AMEDIAFORMAT_KEY_SAMPLE_RATE, &s_audio.rate);
+    AMediaFormat_getInt32(s_audio.format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &s_audio.channels);
+    *rate = s_audio.rate;
+    *channels = s_audio.channels;
+    return true;
+}
+
+void audio_close() { s_audio.close(); }
+void audio_seek(int64_t us) { s_audio.seek(us); }
+
+// 16-bit PCM: 1 with it, 0 at the end, -1 none yet.  The format may change
+// with the first buffer (rate, channels).
+int audio_next(const int16_t **pcm, size_t *frames, int64_t *pts_us, int *rate, int *channels)
+{
+    const uint8_t *b;
+    size_t size;
+    int r = s_audio.next(&b, &size, pts_us, 10000);
+    if (r <= 0) return r;
+    *rate = s_audio.rate;
+    *channels = s_audio.channels > 0 ? s_audio.channels : 2;
+    *pcm = (const int16_t *)b;
+    *frames = size / (2 * (size_t)*channels);
+    return 1;
+}
+
+#else // Windows: Media Foundation
+
+std::wstring widen(const char *s)
+{
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+    return w;
+}
+
+// Media Foundation for the calling thread (VLDP's or the audio thread).
+struct mf_thread
+{
+    bool com = false, mf = false;
+    void start()
+    {
+        if (!com) com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+        if (!mf) mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+    }
+    void stop()
+    {
+        if (mf) MFShutdown();
+        if (com) CoUninitialize();
+        mf = com = false;
+    }
+};
+
+struct reader
+{
+    IMFSourceReader *r = nullptr;
+    IMFMediaBuffer *locked = nullptr;
+    IMF2DBuffer *locked2d = nullptr;
+    DWORD stream = 0;
+    UINT32 w = 0, h = 0, alloc_h = 0;
+    UINT32 par_num = 1, par_den = 1;
+    LONG stride = 0;
+    UINT32 rate = 0, channels = 0;
+    bool video = false;
+
+    bool open(const char *file, bool is_video)
+    {
+        video = is_video;
+        IMFAttributes *a = nullptr;
+        HRESULT hr = MFCreateAttributes(&a, 2);
+        if (FAILED(hr)) { LOGE << fmt("MP4: Media Foundation is not available (0x%08lx)", hr); return false; }
+        a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, video && g_lr_vldp_hwdec ? TRUE : FALSE);
+        if (video) a->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        hr = MFCreateSourceReaderFromURL(widen(file).c_str(), a, &r);
+        a->Release();
+        if (FAILED(hr)) { LOGE << fmt("MP4: Media Foundation could not open %s (0x%08lx)", file, hr); return false; }
+
+        stream = video ? (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM : (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM;
+        r->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        if (FAILED(r->SetStreamSelection(stream, TRUE)))
+        {
+            LOGE << fmt("MP4: %s has no %s track", file, video ? "video" : "audio");
+            return false;
+        }
+
+        IMFMediaType *t = nullptr;
+        hr = MFCreateMediaType(&t);
+        if (SUCCEEDED(hr))
+        {
+            t->SetGUID(MF_MT_MAJOR_TYPE, video ? MFMediaType_Video : MFMediaType_Audio);
+            t->SetGUID(MF_MT_SUBTYPE, video ? MFVideoFormat_NV12 : MFAudioFormat_PCM);
+            if (!video) t->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            hr = r->SetCurrentMediaType(stream, nullptr, t);
+            t->Release();
+        }
+        if (FAILED(hr))
+        {
+            LOGE << fmt("MP4: no %s decoder for %s (0x%08lx)", video ? "video" : "audio", file, hr);
+            return false;
+        }
+        read_type();
+        return true;
+    }
+
+    void read_type()
+    {
+        IMFMediaType *t = nullptr;
+        if (FAILED(r->GetCurrentMediaType(stream, &t))) return;
+        if (video)
+        {
+            MFGetAttributeSize(t, MF_MT_FRAME_SIZE, &w, &alloc_h);
+            h = alloc_h;
+            MFVideoArea area;
+            if (SUCCEEDED(t->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8 *)&area, sizeof(area), nullptr)))
+                h = (UINT32)area.Area.cy;
+            UINT32 s = 0;
+            stride = SUCCEEDED(t->GetUINT32(MF_MT_DEFAULT_STRIDE, &s)) ? (LONG)s : (LONG)w;
+            UINT32 pn = 0, pd = 0;
+            if (SUCCEEDED(MFGetAttributeRatio(t, MF_MT_PIXEL_ASPECT_RATIO, &pn, &pd)) && pn && pd)
+            {
+                par_num = pn;
+                par_den = pd;
+            }
+        }
+        else
+        {
+            t->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+            t->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels);
+        }
+        t->Release();
+    }
+
+    void unlock()
+    {
+        if (locked2d) { locked2d->Unlock2D(); locked2d->Release(); locked2d = nullptr; }
+        if (locked) { locked->Unlock(); locked->Release(); locked = nullptr; }
+    }
+
+    void close()
+    {
+        unlock();
+        if (r) r->Release();
+        *this = reader();
+    }
+
+    void seek(int64_t us)
+    {
+        unlock();
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        v.vt = VT_I8;
+        v.hVal.QuadPart = us * 10;
+        r->SetCurrentPosition(GUID_NULL, v);
+    }
+
+    // The next sample's data, locked until the next call: 1 with it, 0 at
+    // the end of the stream (or after a read error, which is logged), -1
+    // for a gap.
+    int next(BYTE **data, DWORD *size, LONG *pitch, int64_t *pts_us)
+    {
+        unlock();
+        DWORD index = 0, flags = 0;
+        LONGLONG ts = 0;
+        IMFSample *s = nullptr;
+        const HRESULT hr = r->ReadSample(stream, 0, &index, &flags, &ts, &s);
+        if (FAILED(hr))
+        {
+            LOGE << fmt("MP4: reading the %s failed (0x%08lx), ending the stream there",
+                        video ? "video" : "audio", hr);
+            return 0;
+        }
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) read_type();
+        if (!s) return (flags & MF_SOURCE_READERF_ENDOFSTREAM) ? 0 : -1;
+        IMFMediaBuffer *b = nullptr;
+        s->ConvertToContiguousBuffer(&b);
+        s->Release();
+        if (!b) return -1;
+        *pts_us = ts / 10;
+        if (pitch && SUCCEEDED(b->QueryInterface(IID_IMF2DBuffer, (void **)&locked2d)) &&
+            SUCCEEDED(locked2d->Lock2D(data, pitch)))
+        {
+            b->GetCurrentLength(size);
+            b->Release();
+            return 1;
+        }
+        if (locked2d) { locked2d->Release(); locked2d = nullptr; }
+        DWORD max = 0;
+        if (FAILED(b->Lock(data, &max, size))) { b->Release(); return -1; }
+        locked = b;
+        if (pitch) *pitch = stride;
+        return 1;
+    }
+};
+
+mf_thread s_video_mf;
+reader s_video;
+
+bool video_open(const char *file, mp4::stream_info *info, int64_t *start_us, std::string *decoder)
+{
+    s_video_mf.start();
+    if (!s_video.open(file, true))
+    {
+        s_video.close();
+        s_video_mf.stop();
+        return false;
+    }
+    *decoder = g_lr_vldp_hwdec ? "Media Foundation" : "Media Foundation (software)";
+
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    int64_t duration = 0;
+    if (SUCCEEDED(s_video.r->GetPresentationAttribute((DWORD)MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &v)))
+        duration = (int64_t)v.uhVal.QuadPart / 10;
+    PropVariantClear(&v);
+
+    UINT32 num = 0, den = 0;
+    IMFMediaType *t = nullptr;
+    double rate = 30000.0 / 1001;
+    if (SUCCEEDED(s_video.r->GetNativeMediaType(s_video.stream, 0, &t)))
+    {
+        if (SUCCEEDED(MFGetAttributeRatio(t, MF_MT_FRAME_RATE, &num, &den)) && num && den)
+            rate = (double)num / den;
+        t->Release();
+    }
+    // where the pictures start (the first one's time)
+    *start_us = 0;
+    BYTE *data;
+    DWORD size;
+    LONG pitch;
+    int64_t pts;
+    if (s_video.next(&data, &size, &pitch, &pts) == 1) *start_us = pts;
+    s_video.seek(0);
+
+    if (s_video.w == 0 || s_video.h == 0 || duration <= *start_us)
+    {
+        LOGE << fmt("MP4: %s has no picture size or no length", file);
+        s_video.close();
+        s_video_mf.stop();
+        return false;
+    }
+    info->w = (int)s_video.w;
+    info->h = (int)s_video.h;
+    info->sar_num = (int)s_video.par_num;
+    info->sar_den = (int)s_video.par_den;
+    info->fpks = (uint32_t)(rate * 1000 + 0.5);
+    info->frames = (uint32_t)((double)(duration - *start_us) * rate / 1e6 + 0.5);
+    return true;
+}
+
+void video_close()
+{
+    s_video.close();
+    s_video_mf.stop();
+}
+
+void video_seek(int64_t us) { s_video.seek(us); }
+
+int video_next(decoded *out)
+{
+    BYTE *b = nullptr;
+    DWORD size = 0;
+    LONG pitch = 0;
+    const int r = s_video.next(&b, &size, &pitch, &out->pts_us);
+    if (r <= 0) return r;
+    if (pitch <= 0) pitch = (LONG)s_video.w;
+    out->pic = vldp_picture();
+    out->pic.y = b;
+    out->pic.ypitch = pitch;
+    out->pic.uv = b + (size_t)pitch * s_video.alloc_h;
+    out->pic.uvpitch = pitch;
+    return 1;
+}
+
+void video_release() { s_video.unlock(); }
+
+mf_thread s_audio_mf;
+reader s_audio;
+
+bool audio_open(const char *file, int *rate, int *channels)
+{
+    s_audio_mf.start();
+    if (!s_audio.open(file, false)) { s_audio.close(); s_audio_mf.stop(); return false; }
+    *rate = (int)s_audio.rate;
+    *channels = (int)s_audio.channels;
+    return true;
+}
+
+void audio_close()
+{
+    s_audio.close();
+    s_audio_mf.stop();
+}
+
+void audio_seek(int64_t us) { s_audio.seek(us); }
+
+int audio_next(const int16_t **pcm, size_t *frames, int64_t *pts_us, int *rate, int *channels)
+{
+    BYTE *b = nullptr;
+    DWORD size = 0;
+    const int r = s_audio.next(&b, &size, nullptr, pts_us);
+    if (r <= 0) return r;
+    *rate = (int)s_audio.rate;
+    *channels = s_audio.channels > 0 ? (int)s_audio.channels : 2;
+    *pcm = (const int16_t *)b;
+    *frames = size / (2 * (size_t)*channels);
+    return 1;
+}
+
+#endif
+
+// ---------------------------------------------------------------------------
+// Video: picture numbering
+// ---------------------------------------------------------------------------
+
+mp4::frame_fn s_draw = nullptr;
+mp4::abort_fn s_abort = nullptr;
+bool s_open = false;
+double s_fps = 30;
+int64_t s_start_us = 0;
+long s_target = 0;     // first picture to put out after a seek
+long s_expected = 0;   // next picture number to put out
+
+long frame_of(int64_t pts_us) { return (long)((double)(pts_us - s_start_us) * s_fps / 1e6 + 0.5); }
+int64_t time_of(long frame) { return s_start_us + (int64_t)((double)frame * 1e6 / s_fps); }
+
+} // namespace
+
+namespace mp4 {
+
+bool handles(const char *file)
+{
+    const char *dot = file ? strrchr(file, '.') : nullptr;
+    if (!dot) return false;
+    std::string e = dot + 1;
+    for (auto &c : e) c = (char)tolower((unsigned char)c);
+    return e == "mp4" || e == "m4v" || e == "mkv";
+}
+
+bool open(const char *file, frame_fn draw, abort_fn abort, stream_info *info)
+{
+    close();
+    std::string decoder;
+    if (!video_open(file, info, &s_start_us, &decoder)) return false;
+    s_draw = draw;
+    s_abort = abort;
+    s_fps = info->fpks / 1000.0;
+    s_open = true;
+    s_target = s_expected = 0;
+    LOGI << fmt("VLDP: playing %s (%dx%d, %.3f fps, %u frames) with %s", base_name(file).c_str(), info->w,
+                info->h, s_fps, info->frames, decoder.c_str());
+    return true;
+}
+
+void close()
+{
+    if (!s_open) return;
+    video_close();
+    s_open = false;
+}
+
+bool active() { return s_open; }
+
+void seek(uint32_t frame)
+{
+    if (!s_open) return;
+    s_target = s_expected = (long)frame;
+    video_seek(time_of((long)frame));
+}
+
+bool decode_some()
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        decoded d;
+        const int r = video_next(&d);
+        if (r == 0) return false;
+        if (r < 0) return true; // nothing yet: let VLDP look at its commands
+        const long n = frame_of(d.pts_us);
+        if (n < s_target) { video_release(); continue; } // before the frame searched to
+
+        // pictures missing from the stream still count, as on a laserdisc
+        while (s_expected < n)
+        {
+            ++s_expected;
+            vldp_picture none = vldp_picture();
+            none.placeholder = 1;
+            s_draw(none);
+            if (s_abort()) { video_release(); return true; }
+        }
+        if (n >= s_expected)
+        {
+            s_expected = n + 1;
+            s_draw(d.pic);
+        }
+        video_release();
+        if (s_abort()) return true;
+    }
+    return true;
+}
+
+} // namespace mp4
+
+// ---------------------------------------------------------------------------
+// Audio: decoded ahead into a ring of 44100 Hz stereo
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const int OUT_RATE = 44100;
+const size_t RING_FRAMES = OUT_RATE; // a second
+
+std::thread s_audio_thread;
+std::mutex s_amutex;
+std::condition_variable s_acv;
+bool s_aquit = false, s_aeos = false;
+bool s_afailed = false;          // the track could not be opened
+bool s_seek_pending = false;
+uint64_t s_seek_sample = 0;      // where the ring's data starts after a seek
+uint64_t s_generation = 0;
+std::vector<int16_t> s_ring;     // stereo frames
+size_t s_rhead = 0, s_rcount = 0;
+size_t s_deficit = 0;            // frames of silence handed out that the ring still owes
+
+void ring_put(const int16_t *lr, size_t frames)
+{
+    for (size_t i = 0; i < frames; ++i)
+    {
+        const size_t at = (s_rhead + s_rcount) % RING_FRAMES;
+        s_ring[2 * at] = lr[2 * i];
+        s_ring[2 * at + 1] = lr[2 * i + 1];
+        ++s_rcount;
+    }
+}
+
+void audio_worker(std::string file)
+{
+    int rate = 0, channels = 0;
+    if (!audio_open(file.c_str(), &rate, &channels))
+    {
+        // logged by audio_open(); read() hands out the end of the track
+        std::lock_guard<std::mutex> l(s_amutex);
+        s_afailed = s_aeos = true;
+        return;
+    }
+    LOGI << fmt("VLDP: audio from %s", base_name(file.c_str()).c_str());
+
+    std::vector<int16_t> out;
+    uint64_t want = 0;              // index of the next output sample to write
+    uint64_t gen = (uint64_t)-1;
+    bool eos = false;
+
+    for (;;)
+    {
+        uint64_t seek_to = 0;
+        bool do_seek = false;
+        {
+            std::unique_lock<std::mutex> l(s_amutex);
+            s_acv.wait(l, [&] { return s_aquit || s_seek_pending || (!eos && s_rcount + 4096 < RING_FRAMES); });
+            if (s_aquit) break;
+            if (s_seek_pending)
+            {
+                s_seek_pending = false;
+                do_seek = true;
+                seek_to = s_seek_sample;
+                gen = s_generation;
+            }
+        }
+        if (do_seek)
+        {
+            audio_seek((int64_t)(seek_to * 1000000 / OUT_RATE));
+            want = seek_to;
+            eos = false;
+            continue;
+        }
+
+        const int16_t *pcm;
+        size_t frames;
+        int64_t pts;
+        const int r = audio_next(&pcm, &frames, &pts, &rate, &channels);
+        if (r == 0)
+        {
+            eos = true;
+            std::lock_guard<std::mutex> l(s_amutex);
+            if (gen == s_generation) s_aeos = true;
+            continue;
+        }
+        if (r < 0 || rate <= 0 || frames == 0) continue;
+
+        // which output sample this buffer starts at, and how much of it is
+        // before the one wanted
+        const double first = (double)pts * OUT_RATE / 1e6;
+        if (first + (double)frames * OUT_RATE / rate <= (double)want) continue;
+        const double step = (double)rate / OUT_RATE;
+        double ipos = ((double)want - first) * rate / OUT_RATE; // input frame of 'want'
+        if (ipos < 0)
+        {
+            // a gap before this buffer: silence up to it
+            const size_t gap = (size_t)(-ipos / step);
+            out.assign(gap * 2, 0);
+            want += gap;
+            ipos = 0;
+        }
+        else
+            out.clear();
+
+        auto sample = [&](size_t i, int c) -> int {
+            if (channels == 1) return pcm[i];
+            return pcm[i * channels + c];
+        };
+        for (; ipos + 1 < (double)frames; ipos += step)
+        {
+            const size_t i = (size_t)ipos;
+            const double f = ipos - i;
+            for (int c = 0; c < 2; ++c)
+                out.push_back((int16_t)(sample(i, c) * (1 - f) + sample(i + 1, c) * f));
+            ++want;
+        }
+
+        std::unique_lock<std::mutex> l(s_amutex);
+        if (gen != s_generation) continue; // a seek came in meanwhile
+        size_t n = out.size() / 2;
+        const int16_t *p = out.data();
+        // silence already handed out in place of these
+        const size_t owed = std::min(n, s_deficit);
+        s_deficit -= owed;
+        p += 2 * owed;
+        n -= owed;
+        while (n)
+        {
+            s_acv.wait(l, [&] { return s_aquit || s_seek_pending || s_rcount < RING_FRAMES; });
+            if (s_aquit || s_seek_pending) break;
+            const size_t k = std::min(n, RING_FRAMES - s_rcount);
+            ring_put(p, k);
+            p += 2 * k;
+            n -= k;
+        }
+    }
+    audio_close();
+}
+
+} // namespace
+
+namespace mp4audio {
+
+void open(const char *file)
+{
+    close();
+    s_ring.assign(RING_FRAMES * 2, 0);
+    s_rhead = s_rcount = s_deficit = 0;
+    s_aquit = s_aeos = s_afailed = false;
+    s_seek_pending = true;
+    s_seek_sample = 0;
+    ++s_generation;
+    s_audio_thread = std::thread(audio_worker, std::string(file));
+}
+
+void close()
+{
+    if (!s_audio_thread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> l(s_amutex);
+        s_aquit = true;
+    }
+    s_acv.notify_all();
+    s_audio_thread.join();
+}
+
+void seek(uint64_t sample)
+{
+    std::lock_guard<std::mutex> l(s_amutex);
+    s_seek_pending = true;
+    s_seek_sample = sample;
+    ++s_generation;
+    s_rhead = s_rcount = s_deficit = 0;
+    s_aeos = s_afailed;
+    s_acv.notify_all();
+}
+
+long read(uint8_t *buf, size_t bytes)
+{
+    const size_t frames = bytes / 4;
+    int16_t *out = (int16_t *)buf;
+    std::lock_guard<std::mutex> l(s_amutex);
+    if (s_rcount == 0 && s_aeos) return 0;
+    const size_t have = std::min(frames, s_rcount);
+    for (size_t i = 0; i < have; ++i)
+    {
+        const size_t at = (s_rhead + i) % RING_FRAMES;
+        out[2 * i] = s_ring[2 * at];
+        out[2 * i + 1] = s_ring[2 * at + 1];
+    }
+    s_rhead = (s_rhead + have) % RING_FRAMES;
+    s_rcount -= have;
+    s_acv.notify_all();
+    if (have < frames && !s_aeos)
+    {
+        // the decoder is behind (it is still opening the file, or getting
+        // to a seek's target): silence now, and those samples are skipped
+        // when they arrive so the sound stays in step with the picture
+        memset(out + 2 * have, 0, (frames - have) * 4);
+        s_deficit += frames - have;
+        return (long)(frames * 4);
+    }
+    return (long)(have * 4);
+}
+
+} // namespace mp4audio
+
+#endif
