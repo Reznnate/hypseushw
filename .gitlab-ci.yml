@@ -52,7 +52,7 @@ libretro-build-windows-x64:
     - .libretro-windows-cmake-x86_64
     - .core-defs
 
-# Linux 64-bit (Singe 2 MP4 video has no decoder on Linux yet)
+# Linux 64-bit
 libretro-build-linux-x64:
   extends:
     - .libretro-linux-cmake-x86_64

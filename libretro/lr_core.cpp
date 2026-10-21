@@ -823,7 +823,7 @@ static struct retro_core_option_v2_category g_option_categories[] = {
 static struct retro_core_option_v2_definition g_option_defs[] = {
     {"daphne_cpu_fallback", "CPU Fallback", NULL,
      "Render on the CPU instead of the GPU, and decode laserdisc video in software (MPEG-2 with "
-     "libmpeg2, Singe 2's H.264 with the platform's software decoder). For comparison and "
+     "libmpeg2, Singe 2's MP4 with FFmpeg). For comparison and "
      "troubleshooting: much slower on most devices. Takes effect when a game is loaded.",
      NULL, "video", LR_ON_OFF, "disabled"},
     {"daphne_blank_searches", "Blank Video During Searches", NULL,

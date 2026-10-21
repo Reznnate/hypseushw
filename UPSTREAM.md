@@ -9,6 +9,7 @@
 | SDL3_image (Singe images) | https://github.com/libsdl-org/SDL_image | release-3.4.8 (0891fc3) | submodule `src/SDL3_image` |
 | SDL3_ttf (Singe text) | https://github.com/libsdl-org/SDL_ttf | release-3.2.2 (a1ce367) | submodule `src/SDL3_ttf` |
 | FreeType (for SDL3_ttf) | https://github.com/freetype/freetype | VER-2-14-3 (0a0221a) | submodule `src/freetype` |
+| FFmpeg (Singe 2's MP4 on the CPU) | https://github.com/FFmpeg/FFmpeg | n8.1.3 (1041abd) | submodule `src/ffmpeg` |
 | libretro-common (libretro.h, libco) | https://github.com/libretro/libretro-common | a3194c18ba65ef89734e1898a2f61403c255d368 | submodule `src/libretro-common` |
 | libretro's older Daphne core (reference only, not built) | https://github.com/libretro/daphne | 6f1695dd1f376060666eec0a416ff56bb6c9cccc | not included |
 

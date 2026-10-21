@@ -2,7 +2,7 @@
 
 A 64-bit libretro core, with sound, that plays the same data as `daphne.exe`.
 It also comes as a standalone Android app.
-Built and tested on Windows x64 and Android arm64 (RetroArch and the app), and on Linux x64 with the test host (Daphne and Singe 1 games; Singe 2's MP4 video has no decoder on Linux yet).
+Built and tested on Windows x64 and Android arm64 (RetroArch and the app), and on Linux x64 with the test host.
 No BIOS or system files are needed.
 The engine is [Hypseus Singe](https://github.com/DirtBagXon/hypseus-singe), vendored in `core/`.
 Libretro changes are kept under `#ifdef __LIBRETRO__`.
@@ -33,8 +33,8 @@ The core does the same: for `framefile/<game>.txt` it looks for `<game>.bat` in 
 The windowing arguments in it (`-x`, `-y`, `-fullscreen`, `-opengl` and the like) are dropped.
 
 For a Singe 2 game (`Singe.exe -v <video> <script>`), the video plays as the laserdisc: frame N is the Nth picture of the MP4 (or M4V or MKV), and its sound track is the laserdisc audio.
-The platform decodes it: MediaCodec on Android, Media Foundation on Windows.
-Both use the hardware decoder by default; with *CPU Fallback* on, Android uses its software decoder instead and Windows turns off Media Foundation's hardware decoding.
+By default the platform decodes it with the hardware decoder: MediaCodec on Android, Media Foundation on Windows.
+With *CPU Fallback* on, and always on Linux, FFmpeg decodes it on the CPU (H.264 video, AAC audio).
 A search goes to the key frame before the target and decodes forward to it.
 `-l` and `-e` (video and effects volume, in percent) carry over; the other `Singe.exe` options do not matter here.
 Singe 2's own menu (`Menu.bat`) is not supported.
@@ -63,7 +63,7 @@ All of them override the preset.
 | Prefer samples (`daphne_prefer_samples`) | On | Uses sound samples instead of emulated sound. |
 | Blank searches (`daphne_blank_searches`) | On | Blanks the video during laserdisc searches. |
 | Service and Test switches (`daphne_service_buttons`) | Off | Puts the operator's Service and Test switches on L3 and R3. Off by default, because a stick click can also carry Coin or Start, and Test reboots most games into their diagnostics. |
-| CPU Fallback (`daphne_cpu_fallback`) | Off | *Off* renders the video on the GPU (Vulkan or OpenGL (ES) 3) and decodes it with the hardware decoder where there is one. *On* does both on the CPU: libmpeg2 for MPEG-2 video, Android's software decoder for Singe 2's H.264 and HEVC, and Media Foundation without hardware decoding on Windows. Takes effect when a game is next loaded. |
+| CPU Fallback (`daphne_cpu_fallback`) | Off | *Off* renders the video on the GPU (Vulkan or OpenGL (ES) 3) and decodes it with the hardware decoder where there is one. *On* does both on the CPU: libmpeg2 for MPEG-2 video and FFmpeg for Singe 2's MP4, the same on every platform. Takes effect when a game is next loaded. |
 
 The GPU renderer uses the same API as the frontend's video driver, which it learns from RetroArch:
 
@@ -170,8 +170,9 @@ Clone with `--recursive`, or run `tools/fetch-deps.sh` (the same as `git submodu
 
 Prerequisites:
 
-- **Windows:** MSYS2, in a UCRT64 shell: `pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,zlib,sdl3}` (SDL3 only for `lr-host`).
+- **Windows:** MSYS2, in a UCRT64 shell: `pacman -S make mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,zlib,nasm,sdl3}` (SDL3 only for `lr-host`).
   `mingw-w64-ucrt-x86_64-vulkan-headers` is optional: without it the Vulkan code uses the copy of the headers in `src/SDL3/src/video/khronos`.
+- **Every platform:** FFmpeg (`src/ffmpeg`) is built with its own `configure`, so the build needs `sh` and `make` (MSYS2's on Windows, also for the Android build there) and, for x86, `nasm` (without it FFmpeg's C code is used, which is slower).
 - **Android:** the Android SDK with platform 35 and NDK 29.0.14206865, plus the SDK's CMake 3.22.1 and JDK 17 for the app.
   `android/local.properties` (not committed) gives the SDK location as `sdk.dir=...`, or set `ANDROID_HOME`.
 

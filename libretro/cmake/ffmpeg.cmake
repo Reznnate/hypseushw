@@ -65,7 +65,9 @@ set(FF_ARGS
     --enable-decoder=h264,aac
     --enable-parser=h264,aac)
 if (CMAKE_CROSSCOMPILING)
-    list(APPEND FF_ARGS --enable-cross-compile)
+    # configure also wants a compiler for the build machine
+    find_program(FFMPEG_HOST_CC NAMES cc gcc clang HINTS C:/msys64/ucrt64/bin REQUIRED)
+    list(APPEND FF_ARGS --enable-cross-compile --host-cc=${FFMPEG_HOST_CC})
 endif()
 
 # Hand-written x86 assembly needs nasm; without it the decoders are C only
@@ -92,9 +94,27 @@ foreach(l ${FF_LIBS})
 endforeach()
 
 # configure and make run with the shell's own tools first on the PATH
-# (MSYS2's on Windows, rather than whichever sed or awk comes first)
+# (MSYS2's on Windows, rather than whichever sed or awk comes first), then
+# the compilers' folders (MinGW's gcc finds its assembler and its cc1's DLLs
+# on the PATH, so the host compiler's folder goes before the NDK's)
+set(FF_TOOL_DIRS "")
+foreach(tool ${FFMPEG_HOST_CC} ${CMAKE_C_COMPILER})
+    get_filename_component(d "${tool}" DIRECTORY)
+    string(APPEND FF_TOOL_DIRS " \"${d}\"")
+endforeach()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-run.sh"
-     "export PATH=\"/usr/bin:/bin:$PATH\"\nexec \"$@\"\n")
+"p=/usr/bin:/bin
+for d in${FF_TOOL_DIRS}; do
+    command -v cygpath >/dev/null 2>&1 && d=$(cygpath -u \"$d\")
+    p=\"$p:$d\"
+done
+export PATH=\"$p:$PATH\"
+# Windows compilers need a temporary folder, which MSYS2's shell may not pass on
+if command -v cygpath >/dev/null 2>&1 && [ -z \"$TMP$TEMP\" ]; then
+    TMP=$(cygpath -w /tmp); TEMP=$TMP; export TMP TEMP
+fi
+exec \"$@\"
+")
 set(FF_ENV ${FFMPEG_SH} "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-run.sh")
 
 ExternalProject_Add(ffmpeg_ext

@@ -35,6 +35,7 @@ components, is at https://github.com/Reznnate/hypseushw
 | FreeType | FreeType License (FTL), chosen from FTL / GPL-2.0-or-later |
 | libogg | BSD-3-Clause |
 | libvorbis | BSD-3-Clause |
+| FFmpeg (libavformat, libavcodec, libavutil; MP4/Matroska demuxers, H.264 and AAC decoders only, built without its GPL or non-free parts) | LGPL-2.1-or-later |
 | libretro-common (`libretro.h`) | MIT |
 | libretro-common libco | public domain (`libretro/lr_libco_aarch64.c` is derived from it) |
 
