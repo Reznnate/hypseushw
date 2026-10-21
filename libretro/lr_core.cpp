@@ -50,6 +50,8 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "config.h"
@@ -103,6 +105,31 @@ static retro_log_printf_t         log_cb;
 // Logging
 // ---------------------------------------------------------------------------
 
+// libretro calls are made on the frontend's thread only (the engine runs
+// there too, in a coroutine).  What the core's own threads log (the video
+// decoder, the audio track) waits in a queue for the next retro_run.
+static std::thread::id g_frontend_thread;
+static std::mutex g_log_mutex;
+static std::vector<std::pair<enum retro_log_level, std::string>> g_log_queue;
+static size_t g_log_dropped;
+static const size_t LR_LOG_QUEUE_MAX = 256;
+
+// On the frontend's thread: hands the queued messages to the frontend.
+static void lr_log_flush(void)
+{
+    std::vector<std::pair<enum retro_log_level, std::string>> q;
+    size_t dropped;
+    {
+        std::lock_guard<std::mutex> l(g_log_mutex);
+        q.swap(g_log_queue);
+        dropped = g_log_dropped;
+        g_log_dropped = 0;
+    }
+    if (!log_cb) return;
+    for (const auto &m : q) log_cb(m.first, "[Daphne] %s\n", m.second.c_str());
+    if (dropped) log_cb(RETRO_LOG_WARN, "[Daphne] %u log messages dropped\n", (unsigned)dropped);
+}
+
 static void lr_log(enum retro_log_level level, const char *fmt, ...)
 {
     char buf[1024];
@@ -111,16 +138,27 @@ static void lr_log(enum retro_log_level level, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    if (log_cb)
-        log_cb(level, "[Daphne] %s\n", buf);
-    else
+    if (!log_cb)
+    {
         fprintf(stderr, "[Daphne] %s\n", buf);
+        return;
+    }
+    if (std::this_thread::get_id() != g_frontend_thread)
+    {
+        std::lock_guard<std::mutex> l(g_log_mutex);
+        if (g_log_queue.size() < LR_LOG_QUEUE_MAX)
+            g_log_queue.emplace_back(level, buf);
+        else
+            ++g_log_dropped;
+        return;
+    }
+    lr_log_flush(); // what other threads logged first, in order
+    log_cb(level, "[Daphne] %s\n", buf);
 }
 
 namespace {
-// Routes the engine's plog output to the frontend log.  The decoder and audio
-// threads log too, so log_cb is also called off the frontend's thread: the
-// one libretro call made there, which frontends' loggers accept.
+// Routes the engine's plog output to the frontend log (through lr_log, so
+// from any thread).
 class RetroAppender : public plog::IAppender
 {
   public:
@@ -1207,6 +1245,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
     struct retro_log_callback logging;
     if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging))
         log_cb = logging.log;
+    g_frontend_thread = std::this_thread::get_id();
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -1217,6 +1256,7 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb) { input_state_cb = 
 
 RETRO_API void retro_init(void)
 {
+    g_frontend_thread = std::this_thread::get_id();
     // Named up front: otherwise SDL asks the OS for the executable name the
     // first time a thread is created, which on Android goes through JNI.
     SDL_SetAppMetadata(CORE_NAME, CORE_VERSION, "libretro.hypseus");
@@ -1245,6 +1285,7 @@ RETRO_API void retro_init(void)
 RETRO_API void retro_deinit(void)
 {
     if (TTF_WasInit()) TTF_Quit();
+    lr_log_flush();
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info)
@@ -1687,6 +1728,7 @@ RETRO_API void retro_unload_game(void)
     g_emu_co = NULL;
     g_stage  = STAGE_NONE;
     leave_dir();
+    lr_log_flush(); // what the game's threads logged on their way out
 }
 
 // Search and skip response: how long until the target frame was decoded
@@ -1753,6 +1795,7 @@ static void present(void)
 
 RETRO_API void retro_run(void)
 {
+    lr_log_flush();
     if (g_error_mode) { run_error_mode(); return; }
     if (!g_emu_co) return;
     const uint64_t frame_start = SDL_GetTicksNS();
