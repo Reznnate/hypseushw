@@ -1320,14 +1320,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
     g_error_mode = false;
     g_error_frames = 0;
     g_error_msg.clear();
-    g_lr_vldp_error = nullptr;
     // CPU Fallback: render and decode on the CPU, as the original Daphne
     const bool cpu_fallback = option_enabled("daphne_cpu_fallback", false);
 
     // Hardware video decoding unless CPU Fallback is on: on Android MediaCodec
-    // for MPEG-2 and Singe 2's H.264 (its software decoders otherwise); on
-    // Windows Media Foundation's hardware transforms for Singe 2's MP4 (MPEG-2
-    // is always libmpeg2 there).  VLDP logs which decoder each file gets.
+    // for MPEG-2 and Singe 2's MP4; on Windows Media Foundation for MP4 (MPEG-2
+    // is always libmpeg2 there).  CPU Fallback, and Linux always, decode MP4
+    // with FFmpeg.  VLDP logs which decoder each file gets.
     g_lr_vldp_hwdec = !cpu_fallback;
 
     g_service_buttons = option_enabled("daphne_service_buttons", false);
@@ -1573,11 +1572,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
         g_emu_co = NULL;
         g_stage  = STAGE_NONE;
         leave_dir();
-        if (g_error_msg.empty())
-        {
-            const char *vldp_err = g_lr_vldp_error.load();
-            lr_show_error(vldp_err ? vldp_err : "The game could not start (see the log)");
-        }
+        if (g_error_msg.empty()) lr_show_error("The game could not start (see the log)");
         return enter_error_mode();
     }
 

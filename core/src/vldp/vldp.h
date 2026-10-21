@@ -268,16 +268,11 @@ extern std::atomic<int> g_lr_presented_pic;
 // clears it for the CPU Fallback core option.  It chooses:
 //  - MPEG-2 on Android: MediaCodec's hardware decoder where the stream
 //    suits it (vldp_hwdec), else libmpeg2;
-//  - MP4 (Singe 2) on Android: the device's decoder, else Android's
-//    software decoder (vldp_mp4);
-//  - MP4 on Windows: Media Foundation with or without hardware transforms.
+//  - MP4 (Singe 2): the platform's decoders (MediaCodec on Android, Media
+//    Foundation on Windows), else FFmpeg on the CPU, as always on Linux
+//    (vldp_mp4).
 // Read when a video file is opened.
 extern std::atomic<int> g_lr_vldp_hwdec;
-
-// Why the last video file could not be opened, when the user can do
-// something about it (a string literal), else NULL: the frontend shows it on
-// the error screen.
-extern std::atomic<const char *> g_lr_vldp_error;
 #endif
 
 #endif // VLDP_H

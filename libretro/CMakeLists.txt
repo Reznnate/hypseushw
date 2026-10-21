@@ -30,6 +30,7 @@ set(DEPS_LIBRETRO_COMMON_DIR "${REPO_ROOT}/src/libretro-common" CACHE PATH "libr
 set(DEPS_SDL3_TTF_DIR        "${REPO_ROOT}/src/SDL3_ttf"        CACHE PATH "SDL3_ttf source")
 set(DEPS_SDL3_IMAGE_DIR      "${REPO_ROOT}/src/SDL3_image"      CACHE PATH "SDL3_image source")
 set(DEPS_FREETYPE_DIR        "${REPO_ROOT}/src/freetype"        CACHE PATH "FreeType source")
+set(DEPS_FFMPEG_DIR          "${REPO_ROOT}/src/ffmpeg"          CACHE PATH "FFmpeg source")
 # Not "daphne": RetroArch already ships an (older) daphne_libretro core, and
 # sharing its file name would let the core updater replace this one.
 set(CORE_NAME "hypseushw" CACHE STRING "Core library base name (<name>_libretro)")
@@ -126,6 +127,12 @@ target_include_directories(lr_mpeg2
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/libmpeg2")
 target_compile_definitions(lr_mpeg2 PRIVATE ${MPEG2_ARCH})
 target_compile_options(lr_mpeg2 PRIVATE -std=gnu89 -w)
+
+# --------------------------------------------------------------------------
+# FFmpeg (MP4 demuxing, H.264/HEVC/AAC decoding): Singe 2's video on Linux,
+# and on every platform with the CPU Fallback core option
+# --------------------------------------------------------------------------
+include(cmake/ffmpeg.cmake)
 
 # --------------------------------------------------------------------------
 # zlib: system/NDK.  Static on Windows, so the DLL needs no zlib1.dll (CMake
@@ -226,6 +233,7 @@ set(LR_SOURCES
 
 add_library(${CORE_NAME}_libretro SHARED ${HYP_SOURCES} ${LR_SOURCES})
 set_target_properties(${CORE_NAME}_libretro PROPERTIES PREFIX "")
+add_dependencies(${CORE_NAME}_libretro ffmpeg_ext) # its headers, before any source compiles
 if (ANDROID)
     # RetroArch for Android names cores <name>_libretro_android.so
     set_target_properties(${CORE_NAME}_libretro PROPERTIES OUTPUT_NAME ${CORE_NAME}_libretro_android)
@@ -276,7 +284,7 @@ else()
 endif()
 
 target_link_libraries(${CORE_NAME}_libretro PRIVATE
-    SDL3::SDL3-static SDL3_image::SDL3_image lr_sdl3_ttf lr_vorbis lr_ogg lr_mpeg2 ZLIB::ZLIB)
+    SDL3::SDL3-static SDL3_image::SDL3_image lr_sdl3_ttf lr_vorbis lr_ogg lr_mpeg2 ffmpeg::ffmpeg ZLIB::ZLIB)
 
 if (WIN32)
     # fully static runtime: the DLL must not depend on MinGW DLLs

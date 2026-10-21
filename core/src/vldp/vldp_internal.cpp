@@ -60,7 +60,6 @@ static void hw_verify_report();
 std::atomic<uint32_t> g_lr_vldp_wait_timer(LR_VLDP_NOT_WAITING);
 std::atomic<uint32_t> g_lr_vldp_next_due(0);
 std::atomic<int> g_lr_vldp_hwdec(0);
-std::atomic<const char *> g_lr_vldp_error(nullptr);
 std::atomic<int> g_lr_vldp_shown_pic(-1);
 std::atomic<int> g_lr_presented_pic(-1);
 
@@ -763,16 +762,6 @@ void idle_handler_open()
 #ifdef VLDP_MP4
     if (!req_precache && mp4::handles(req_file)) {
         idle_handler_open_mp4(req_file);
-        return;
-    }
-#elif defined(__LIBRETRO__)
-    // no MP4 decoder on this platform (Linux): say so, rather than libmpeg2's
-    // complaint about a missing MPEG header
-    const size_t req_len = strlen(req_file);
-    if (!req_precache && req_len > 4 && strcasecmp(req_file + req_len - 4, ".mp4") == 0) {
-        g_lr_vldp_error = "MP4 video (Singe 2) is not supported on this platform";
-        LOGE << g_lr_vldp_error.load();
-        g_out_info.status = STAT_ERROR;
         return;
     }
 #endif

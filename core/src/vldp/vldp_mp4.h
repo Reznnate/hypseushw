@@ -19,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(__LIBRETRO__) && (defined(__ANDROID__) || defined(_WIN32))
+#ifdef __LIBRETRO__
 #define VLDP_MP4 1
 
 #include "vldp_internal.h"
