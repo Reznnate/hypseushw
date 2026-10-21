@@ -10,7 +10,7 @@ The Arcade (Daphne HypseusHW) core has been authored by
 
 - Matt Ownby
 - DirtBagXon
-- HypseusHW contributors
+- HypseusHW contributors Reznnate and Claude AI
 
 The Arcade (Daphne HypseusHW) core is licensed under
 
