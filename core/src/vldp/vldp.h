@@ -273,6 +273,11 @@ extern std::atomic<int> g_lr_presented_pic;
 //  - MP4 on Windows: Media Foundation with or without hardware transforms.
 // Read when a video file is opened.
 extern std::atomic<int> g_lr_vldp_hwdec;
+
+// Why the last video file could not be opened, when the user can do
+// something about it (a string literal), else NULL: the frontend shows it on
+// the error screen.
+extern std::atomic<const char *> g_lr_vldp_error;
 #endif
 
 #endif // VLDP_H

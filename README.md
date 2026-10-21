@@ -2,7 +2,7 @@
 
 A 64-bit libretro core, with sound, that plays the same data as `daphne.exe`.
 It also comes as a standalone Android app.
-Built and tested on Windows x64 and Android arm64 (RetroArch and the app); Linux x64 builds, without Singe 2 video.
+Built and tested on Windows x64 and Android arm64 (RetroArch and the app), and on Linux x64 with the test host (Daphne and Singe 1 games; Singe 2's MP4 video has no decoder on Linux yet).
 No BIOS or system files are needed.
 The engine is [Hypseus Singe](https://github.com/DirtBagXon/hypseus-singe), vendored in `core/`.
 Libretro changes are kept under `#ifdef __LIBRETRO__`.

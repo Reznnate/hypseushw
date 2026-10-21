@@ -179,7 +179,7 @@ int vldp_open(const char *filename)
             g_req_precache = VLDP_FALSE; // we're not precaching ...
             result         = vldp_cmd(VLDP_REQ_OPEN);
         } else {
-            fprintf(stderr, "VLDP ERROR : can't open file %s\n", filename);
+            fprintf(stderr, "VLDP ERROR : can't open file %s\n", filename ? filename : "(null)");
         }
     }
 

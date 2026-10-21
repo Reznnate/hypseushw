@@ -332,6 +332,9 @@ static bool environment(unsigned cmd, void *data)
     case RETRO_ENVIRONMENT_SHUTDOWN:
         g_shutdown = true;
         return true;
+    case RETRO_ENVIRONMENT_SET_MESSAGE:
+        hlog("message: %s\n", ((const retro_message *)data)->msg);
+        return true;
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:
         *(bool *)data = true;
         return true;

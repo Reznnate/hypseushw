@@ -53,6 +53,8 @@ foreach(opt SHARED TEST_LIBRARY EXAMPLES TESTS VIDEO RENDER GPU AUDIO JOYSTICK
 endforeach()
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_STATIC_PIC ON CACHE BOOL "" FORCE)
+# no X11/Wayland: SDL otherwise refuses to configure on Linux without them
+set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 add_subdirectory("${DEPS_SDL3_DIR}" sdl3 EXCLUDE_FROM_ALL)
 
 # --------------------------------------------------------------------------
@@ -126,10 +128,13 @@ target_compile_definitions(lr_mpeg2 PRIVATE ${MPEG2_ARCH})
 target_compile_options(lr_mpeg2 PRIVATE -std=gnu89 -w)
 
 # --------------------------------------------------------------------------
-# zlib: system/NDK.  The static library where there is one (CMake 3.24+
-# honours this; the NDK's zlib is a system library either way).
+# zlib: system/NDK.  Static on Windows, so the DLL needs no zlib1.dll (CMake
+# 3.24+ honours this); shared elsewhere: libz.so.1 is part of every Linux
+# system and of Android, and distro libz.a is not built for shared objects.
 # --------------------------------------------------------------------------
-set(ZLIB_USE_STATIC_LIBS ON)
+if (WIN32)
+    set(ZLIB_USE_STATIC_LIBS ON)
+endif()
 find_package(ZLIB REQUIRED)
 
 # --------------------------------------------------------------------------

@@ -1320,6 +1320,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
     g_error_mode = false;
     g_error_frames = 0;
     g_error_msg.clear();
+    g_lr_vldp_error = nullptr;
     // CPU Fallback: render and decode on the CPU, as the original Daphne
     const bool cpu_fallback = option_enabled("daphne_cpu_fallback", false);
 
@@ -1572,7 +1573,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
         g_emu_co = NULL;
         g_stage  = STAGE_NONE;
         leave_dir();
-        if (g_error_msg.empty()) lr_show_error("The game could not start (see the log)");
+        if (g_error_msg.empty())
+        {
+            const char *vldp_err = g_lr_vldp_error.load();
+            lr_show_error(vldp_err ? vldp_err : "The game could not start (see the log)");
+        }
         return enter_error_mode();
     }
 

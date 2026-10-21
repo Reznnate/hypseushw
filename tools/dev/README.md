@@ -13,6 +13,7 @@ None of them writes next to game data: frame dumps, logs and saves go under
 | `sweep-core.sh` | Runs Daphne games headless through the Windows core with `lr-host`, with scripted button presses; per game a log, frame dumps and a contact sheet. `DATA=` the Daphne folder. |
 | `sweep-singe.sh` | The same for Singe games, in real time. `DATA=` the Daphne folder; titles are framefile names. |
 | `shield-sweep.sh` | The same on an Android device over `adb`, with `lr-host-cli` and the Android core. `DATA=` the Daphne folder as the device sees it. |
+| `ci-local.sh` | Runs the libretro buildbot's Linux or Windows job locally in libretro's build container (Docker, e.g. in WSL). Builds the committed tree. |
 | `sweep-hypseus.ps1` | Baseline sweep of standalone Hypseus (window screenshot, audio RMS, errors) to compare the core against. |
 | `compare-dumps.py` | Mean pixel difference between the frame dumps of two runs. |
 | `decoder-table.py` | Side-by-side table of two sweeps' decoder timings (e.g. hardware vs software). |
