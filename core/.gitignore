@@ -1,0 +1,10 @@
+*.o
+*.d
+*.a
+*.so
+*.zip
+*.rej
+*.orig
+roms
+build
+hypseus

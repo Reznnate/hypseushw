@@ -1,0 +1,247 @@
+Hypseus API functions
+---------------------
+ratioGetX,              sep_get_xratio             (return float)
+ratioGetY,              sep_get_yratio             (return float)
+getFValue,              sep_get_fvalue             (return double)
+takeScreenshot,         sep_screenshot
+
+controllerIsValid,      sep_controller_valid       (ctrl) -- Controller [id] (return bool)
+controllerDoRumble,     sep_controller_rumble      (ctrl, strength, duration) -- Values:[1-4]
+controllerGetButton     sep_controller_button      (ctrl, button, bool[framework adjust])
+controllerGetPadding,   sep_controller_getwad      (return padding int)
+controllerHowMany,      sep_controller_attached    (return number of attached)
+controllerSetPadding,   sep_controller_setwad      (bool) -- Controller mouse index padding (+100)
+
+joyMouseEnable,         sep_joymouse_enable        (bool) -- Enable/Disable JoyMouse input
+keyboardCatchQuit,      sep_keyboard_block_quit    (bool) -- KEY_QUIT/SWITCH_QUIT
+getUserString,          sep_get_idstring           (return user string)
+rewriteStatus,          sep_lua_rewrite            (return bool) -- (-espath enabled)
+
+mouseGetPadding,        sep_get_mouse_padding      (return padding int)
+mouseHowManyReal,       sep_get_number_of_realmice (return number of real mice, excluding GC)
+
+musicLoad,              sep_music_load             (SDL_MIX supported music file) -- (returns id)
+musicPlay,              sep_music_play             (id, [loops]) -1 = infinite -- [returns id]
+musicPause,             sep_music_pause            (id)
+musicIsPlaying,         sep_music_playing          (id) -- (return bool)
+musicResume,            sep_music_resume           (id)
+musicStop,              sep_music_stop             (id, [frames to fade-out])
+musicSetVolume,         sep_music_volume           (0 - 128)
+musicUnload,            sep_music_unload           (id)
+
+mainBezelLoaded,        sep_bezel_loaded           (return bool, hash)
+scoreBezelEnable,       sep_bezel_enable           (bool, int) -- (0)IMG, (1)BEZEL, (2)USB
+scoreBezelClear,        sep_bezel_clear            (void)
+scoreBezelCredits,      sep_bezel_credits          (credits)
+scoreBezelTwinScoreOn,  sep_bezel_second_score     (bool)
+scoreBezelScore,        sep_bezel_player_score     (player, score)
+scoreBezelLives,        sep_bezel_player_lives     (player, lives)
+scoreBezelGetState,     sep_bezel_is_enabled       (return bool)
+
+setOverlaySpriteBlend,  sep_set_overlayblend       (bool)
+setOverlayFullAlpha,    sep_set_overlayfullalpha   (void)
+setOverlayLinearScale,  sep_set_overlayscalemode   (bool) - Enable Bilinear overlay scaling
+setOverlayOpacity,      sep_set_overlayopacity     (0 - 255)
+setOverlayOnTop,        sep_set_overlayontop       (bool) -- (returns bool, hash) Overlay over Bezels
+setOverlaySize,         sep_set_overlaysize        (int)
+setOverlayResolution,   sep_set_custom_overlay     (int, int)
+overlayBanner,          sep_banner                 (txt, [1 - 95])
+overlayPrint,           sep_say                    (x, y, txt, [{color = {r, g, b}, outline = bool}]
+overlaySetMonochrome,   sep_overlay_set_grayscale  (bool)
+
+soundLoadData,          sep_sound_loadata          (wav data)
+
+spriteDrawFrame,        sep_sprite_animate         (x, y, [scale], [scaley], frame, spr)
+spriteDrawRotatedFrame, sep_sprite_animate_rotated (x, y, [scale], [scaley], spr)
+spriteDrawGrid,         sep_sprite_grid            (x, y, spr, sx, sy, sw, sh) - Rect
+spriteFrameHeight,      sep_sprite_height          (spr)
+spriteFrameWidth,       sep_frame_width            (spr)
+spriteGetFrames,        sep_sprite_frames          (spr) -- (0 = no animation)
+spriteLoadFrames,       sep_sprite_loadframes      (no of frames, png) -- Sprite Sheets
+spriteLoadData,         sep_sprite_loadata         (spr data)
+spriteResetColorKey,    sep_sprite_color_rekey     (bool, spr) -- Following GFX operations
+spriteRotateFrame,      sep_sprite_rotateframe     (rotation, frame, spr)
+drawTransparent,        sep_draw_transparent       (bool) -- Transparent Keying
+
+spriteAnimGetFrame,     sep_sprite_get_frame       (spr)
+spriteAnimIsPlaying,    sep_sprite_playing         (return bool)
+spriteAnimLoop,         sep_sprite_loop            (bool, spr)
+spriteAnimPause,        sep_sprite_pause           (spr)
+spriteAnimPlay,         sep_sprite_play            (spr) -- GIF Data Stream or APNG
+spriteAnimSetFrame,     sep_sprite_set_frame       (frame, spr) -- loaded via spriteLoad()
+
+spriteBlend,            sep_sprite_blend           (bool, spr)
+spriteRotate,           sep_sprite_rotate          (rotation, spr)
+spriteRotateAndScale,   sep_sprite_rotatescale     (rotation, scale, [scaley], spr)
+spriteQuality,          sep_sprite_quality         (bool, spr)
+spriteScale,            sep_sprite_scale           (scale, [scaley], spr)
+
+srtLoad,                sep_subtitle_load           (srt) - Return bool on load
+srtClear,               sep_subtitle_clear          (void)
+srtEnable,              sep_subtitle_enable         (bool)
+srtPosition,            sep_subtitle_position       (1 - 95)
+
+vldpFlash               sep_mpeg_set_flash         (void) -- produces white frame
+vldpGetRotate,          sep_mpeg_get_rotate        (return float) -- (-rotate value)
+vldpSetRotate,          sep_mpeg_set_rotate        (degree)
+vldpGetScale,           sep_mpeg_get_scale         (return int) -- (-scalefactor value)
+vldpSetScale,           sep_mpeg_set_scale         (scale) - return bool on update
+vldpFocusArea,          sep_mpeg_focus_area        (x, y, w, h) -- Rect
+vldpGetYUVPixel,        sep_mpeg_get_rawpixel      (return Y, U, V)
+vldpResetFocus,         sep_mpeg_reset_focus       (void)
+vldpSetBlend,           sep_mpeg_set_blend         (bool) -- Enable smoothing filter
+vldpSetLuma,            sep_mpeg_set_luma          (bool, filter level) -- 0 - [4] - 8
+vldpSetMonochrome,      sep_mpeg_set_grayscale     (bool)
+discAudioSuffix,        sep_audio_suffix           (string) -- (return bool on load success)
+
+
+Singe 1 API functions
+---------------------
+
+colorBackground,      sep_color_set_backcolor
+colorForeground,      sep_color_set_forecolor
+debugPrint,           sep_debug_say
+discAudio,            sep_audio_control
+discChangeSpeed,      sep_change_speed
+discGetFrame,         sep_get_current_frame
+discGetState,         sep_get_vldp_state
+discPause,            sep_pause
+discPlay,             sep_play
+discSearch,           sep_search
+discSearchBlanking,   sep_search_blanking
+discSearchBlanking,   sep_search_blanking
+discSetFPS,           sep_set_disc_fps
+discSkipBackward,     sep_skip_backward
+discSkipBlanking,     sep_skip_blanking
+discSkipForward,      sep_skip_forward
+discSkipToFrame,      sep_skip_to_frame
+discStepBackward,     sep_step_backward
+discStepForward,      sep_step_forward
+discStop,             sep_stop
+fontLoad,             sep_font_load
+fontPrint,            sep_say_font
+fontQuality,          sep_font_quality
+fontSelect,           sep_font_select
+fontToSprite,         sep_font_sprite
+keyboardGetMode,      sep_keyboard_get_mode
+keyboardSetMode,      sep_keyboard_set_mode
+overlayClear,         sep_overlay_clear
+overlayGetHeight,     sep_get_overlay_height
+overlayGetWidth,      sep_get_overlay_width
+singeGetPauseFlag,    sep_get_pause_flag
+singeSetPauseFlag,    sep_set_pause_flag
+singeQuit,            sep_singe_quit
+singeVersion,         sep_singe_version
+soundLoad,            sep_sound_load
+soundPlay,            sep_sound_play
+spriteDraw,           sep_sprite_draw
+spriteGetHeight,      sep_sprite_height
+spriteGetWidth,       sep_sprite_width
+spriteLoad,           sep_sprite_load
+vldpGetHeight,        sep_mpeg_get_height
+vldpGetPixel,         sep_mpeg_get_pixel
+vldpGetWidth,         sep_mpeg_get_width
+vldpSetVerbose,       sep_ldp_verbose
+
+
+Singe 2 API functions
+---------------------
+
+colorBackground,      apiColorBackground
+colorForeground,      apiColorForeground
+controllerGetAxis,    apiControllerGetAxis
+debugPrint,           apiDebugPrint
+discAudio,            apiDiscAudio
+discChangeSpeed,      apiDiscChangeSpeed
+discGetFrame,         apiDiscGetFrame
+discGetHeight,        apiDiscGetHeight
+discGetState,         apiDiscGetState
+discGetWidth,         apiDiscGetWidth
+discPause,            apiDiscPause
+discPauseAtFrame,     apiDiscPauseAtFrame
+discPlay,             apiDiscPlay
+discSearch,           apiDiscSearch
+discSearchBlanking,   apiDiscSearchBlanking
+discSetFPS,           apiDiscSetFps
+discSkipBackward,     apiDiscSkipBackward
+discSkipBlanking ,    apiDiscSkipBlanking
+discSkipForward,      apiDiscSkipForward
+discSkipToFrame,      apiDiscSkipToFrame
+discStepBackward,     apiDiscStepBackward
+discStepForward,      apiDiscStepForward
+discStop,             apiDiscStop
+fontLoad,             apiFontLoad
+fontPrint,            apiFontPrint
+fontQuality,          apiFontQuality
+fontSelect,           apiFontSelect
+fontToSprite,         apiFontToSprite
+fontUnload,           apiFontUnload
+keyboardGetMode,      apiKeyboardGetMode
+keyboardGetModifiers, apiKeyboardGetModifiers
+keyboardGetLastDown,  apiKeyboardGetLastDown
+keyboardGetLastUp,    apiKeyboardGetLastUp
+keyboardIsDown,       apiKeyboardIsDown
+keyboardSetMode,      apiKeyboardSetMode
+mouseEnable,          apiMouseEnable
+mouseDisable,         apiMouseDisable
+mouseGetPosition,     apiMouseGetPosition
+mouseHowMany,         apiMouseHowMany
+mouseSetCaptured,     apiMouseSetCaptured
+mouseSetMode,         apiMouseSetMode
+overlayBox,           apiOverlayBox
+overlayCircle,        apiOverlayCircle
+overlayClear,         apiOverlayClear
+overlayEllipse,       apiOverlayEllipse
+overlayGetHeight,     apiOverlayGetHeight
+overlayGetWidth,      apiOverlayGetWidth
+overlayLine,          apiOverlayLine
+overlayPlot,          apiOverlayPlot
+overlayPrint,         apiOverlayPrint
+overlaySetResolution, apiOverlaySetResolution
+scriptExecute,        apiScriptExecute
+scriptPush,           apiScriptPush
+singeDisablePauseKey, apiSingeDisablePauseKey
+singeEnablePauseKey,  apiSingeEnablePauseKey
+singeGetDataPath,     apiSingeGetDataPath
+singeGetHeight,       apiSingeGetHeight
+singeGetPauseFlag,    apiSingeGetPauseFlag
+singeGetScriptPath,   apiSingeGetScriptPath
+singeGetWidth,        apiSingeGetWidth
+singeScreenshot,      apiSingeScreenshot
+singeSetGameName,     apiSingeSetGameName
+singeSetPauseFlag,    apiSingeSetPauseFlag
+singeQuit,            apiSingeQuit
+singeVersion,         apiSingeVersion
+singeWantsCrosshairs, apiSingeWantsCrosshairs
+soundFullStop,        apiSoundFullStop
+soundGetVolume,       apiSoundGetVolume
+soundIsPlaying,       apiSoundIsPlaying
+soundLoad,            apiSoundLoad
+soundPause,           apiSoundPause
+soundPlay,            apiSoundPlay
+soundResume,          apiSoundResume
+soundSetVolume,       apiSoundSetVolume
+soundStop,            apiSoundStop
+soundUnload,          apiSoundUnload
+spriteDraw,           apiSpriteDraw
+spriteGetHeight,      apiSpriteGetHeight
+spriteGetWidth,       apiSpriteGetWidth
+spriteLoad,           apiSpriteLoad
+spriteUnload,         apiSpriteUnload
+videoDraw,            apiVideoDraw
+videoGetFrame,        apiVideoGetFrame
+videoGetFrameCount,   apiVideoGetFrameCount
+videoGetHeight,       apiVideoGetHeight
+videoGetVolume,       apiVideoGetVolume
+videoGetWidth,        apiVideoGetWidth
+videoIsPlaying,       apiVideoIsPlaying
+videoLoad,            apiVideoLoad
+videoPause,           apiVideoPause
+videoPlay,            apiVideoPlay
+videoSeek,            apiVideoSeek
+videoSetVolume,       apiVideoSetVolume
+videoUnload,          apiVideoUnload
+vldpGetHeight,        apiVldpGetHeight
+vldpGetPixel,         apiVldpGetPixel
+vldpGetWidth,         apiVldpGetWidth
+vldpSetVerbose,       apiVldpVerbose

@@ -1,0 +1,325 @@
+/*
+ * singeproxy.h
+ *
+ * Copyright (C) 2006 Scott C. Duensing, 2026 DirtbagXon
+ *
+ * This file is part of HYPSEUS, a laserdisc arcade game emulator
+ *
+ * HYPSEUS is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * HYPSEUS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <memory>
+
+#include "../../vldp/vldp.h"  // to get the vldp structs
+
+#include <SDL3_ttf/SDL_ttf.h>
+#include <SDL3_image/SDL_image.h>
+#include <SDL3_mixer/SDL_mixer.h>
+
+#define SEP_OVERLAY_ALMONO 12
+#define SEP_OVERLAY_ALPHA   4
+#define SEP_OVERLAY_MONO    3
+#define SEP_OVERLAY_FULL    1
+
+#define FONT_QUALITY_SOLID   1
+#define FONT_QUALITY_SHADED  2
+#define FONT_QUALITY_BLENDED 3
+
+#if __cplusplus < 201103L
+#define __func__ "unknown"
+#endif
+
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+
+#define PIXEL_ABGR8888(r,g,b,a) \
+    (((Uint32)(a) << 24) | \
+     ((Uint32)(b) << 16) | \
+     ((Uint32)(g) << 8)  | \
+     ((Uint32)(r)))
+
+#else
+
+#define PIXEL_ABGR8888(r,g,b,a) \
+    (((Uint32)(r))       | \
+     ((Uint32)(g) << 8)  | \
+     ((Uint32)(b) << 16) | \
+     ((Uint32)(a) << 24))
+
+#endif
+
+#define FLAGS_SET(bits, flag)      ((bits) |= (flag))
+#define FLAGS_CLEAR(bits, flag)    ((bits) &= ~(flag))
+#define FLAGS_HAS(bits, flag)      (((bits) & (flag)) != 0)
+#define FLAGS_ASSIGN(bits, flag, value) \
+    ((value) ? FLAGS_SET((bits), (flag)) : FLAGS_CLEAR((bits), (flag)))
+
+#define SEP_SET(flag)            FLAGS_SET(g_sepflags, flag)
+#define SEP_CLEAR(flag)          FLAGS_CLEAR(g_sepflags, flag)
+#define SEP_HAS(flag)            FLAGS_HAS(g_sepflags, flag)
+#define SEP_ASSIGN(flag,v)       FLAGS_ASSIGN(g_sepflags, flag, v)
+
+#define SPRITE_SET(s, flag)      FLAGS_SET((s).flags, flag)
+#define SPRITE_CLEAR(s, flag)    FLAGS_CLEAR((s).flags, flag)
+#define SPRITE_HAS(s, flag)      FLAGS_HAS((s).flags, flag)
+#define SPRITE_ASSIGN(s,f,v)     FLAGS_ASSIGN((s).flags, f, v)
+
+// since lua is written in C, we need to specify that all functions are C-styled
+extern "C"
+{
+#include "lua.h"
+#include "lualib.h"
+#include "lauxlib.h"
+#include "luretro.h"
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void          sep_call_lua(const char *func, const char *sig, ...);
+void          sep_do_blit(SDL_Surface *srfDest);
+void          sep_do_mouse_move(Uint16 x, Uint16 y, Sint16 xrel, Sint16 yrel, Sint8 mouseID);
+void          sep_error(const char *fmt, ...);
+int           sep_lua_error(lua_State *L);
+int           sep_prepare_frame_callback(uint8_t *Yplane, uint8_t *Uplane, uint8_t *Vplane,
+                           int Ypitch, int Upitch, int Vpitch);
+void          sep_print(const char *fmt, ...);
+void          sep_release_vldp();
+void          sep_set_static_pointers(double *m_disc_fps, unsigned int *m_uDiscFPKS);
+void          sep_set_surface(int width, int height);
+void          sep_shutdown(void);
+void          sep_startup(const char *script);
+void          sep_datapaths(const char *path);
+void          sep_altgame(const char *altgame);
+void          sep_minseek(unsigned int seek);
+void          sep_set_espath(void);
+void          sep_rom_compressed(void);
+void          sep_no_crosshair(void);
+void          sep_enable_trace(void);
+void          sep_upgrade_overlay(void);
+void          sep_fullalpha_overlay(void);
+void          sep_keyboard_set_state(int key, bool state);
+void          sep_controller_set_axis(uint8_t axis, int16_t value, uint8_t id);
+
+SDL_Gamepad*        get_gamepad_id(int i);
+void                set_gamepad_wad(bool);
+int                 get_gamepad_wad();
+int                 get_gamepad_attached();
+int                 get_realmouse_attached();
+int                 get_mouse_wad();
+
+struct yuv_buffer
+{
+    std::unique_ptr<uint8_t[]> Y;
+    std::unique_ptr<uint8_t[]> U;
+    std::unique_ptr<uint8_t[]> V;
+    int width  = 0;
+    int height = 0;
+    int Ypitch = 0;
+    int Upitch = 0;
+    int Vpitch = 0;
+    int UVw    = 0;
+    int UVh    = 0;
+};
+
+enum
+{
+    SPR_GFX        = 1u << 0,
+    SPR_SMOOTH     = 1u << 1,
+    SPR_BLEND      = 1u << 2,
+    SPR_REKEY      = 1u << 3,
+    SPR_NOKEY      = 1u << 4,
+    SPR_LOOP       = 1u << 5,
+    SPR_ANIMATING  = 1u << 6
+};
+
+enum SingeFlags : uint16_t
+{
+    SEP_TRACE          = 1u << 0,
+    SEP_ROM_ZIP        = 1u << 1,
+    SEP_PAUSE_STATE    = 1u << 2,
+    SEP_FIRSTSPRITE    = 1u << 3,
+    SEP_FIRSTFONT      = 1u << 4,
+    SEP_FIRSTMIX       = 1u << 5,
+    SEP_FIRSTSND       = 1u << 6,
+    SEP_COLORKEY       = 1u << 7,
+    SEP_ZLUA_ARG       = 1u << 8,
+    SEP_PIXELREADY     = 1u << 9,
+    SEP_SRT_DISPLAY    = 1u << 10,
+    SEP_CROSSHAIR      = 1u << 11,
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+// Singe API Calls
+
+static int sep_audio_control(lua_State *L);
+static int sep_audio_suffix(lua_State *L);
+static int sep_change_speed(lua_State *L);
+static int sep_color_set_backcolor(lua_State *L);
+static int sep_color_set_forecolor(lua_State *L);
+static int sep_draw_transparent(lua_State *L);
+static int sep_hypseus_get_height(lua_State *L);
+static int sep_hypseus_get_width(lua_State *L);
+static int sep_debug_say(lua_State *L);
+static int sep_font_load(lua_State *L);
+static int sep_font_unload(lua_State *L);
+static int sep_font_quality(lua_State *L);
+static int sep_font_select(lua_State *L);
+static int sep_font_sprite(lua_State *L);
+static int sep_get_current_frame(lua_State *L);
+static int sep_get_overlay_height(lua_State *L);
+static int sep_get_overlay_width(lua_State *L);
+static int sep_overlay_set_grayscale(lua_State *L);
+static int sep_mpeg_get_height(lua_State *L);
+static int sep_mpeg_get_pixel(lua_State *L);
+static int sep_mpeg_get_rawpixel(lua_State *L);
+static int sep_mpeg_set_grayscale(lua_State *L);
+static int sep_mpeg_set_luma(lua_State *L);
+static int sep_mpeg_set_blend(lua_State *L);
+static int sep_mpeg_get_width(lua_State *L);
+static int sep_mpeg_get_scale(lua_State *L);
+static int sep_mpeg_get_rotate(lua_State *L);
+static int sep_mpeg_focus_area(lua_State *L);
+static int sep_mpeg_set_flash(lua_State *L);
+static int sep_mpeg_reset_focus(lua_State *L);
+static int sep_vldp_setvolume(lua_State *L);
+static int sep_vldp_getvolume(lua_State *L);
+static int sep_overlay_clear(lua_State *L);
+static int sep_overlay_ellipse(lua_State *L);
+static int sep_overlay_circle(lua_State *L);
+static int sep_overlay_line(lua_State *L);
+static int sep_overlay_plot(lua_State *L);
+static int sep_overlay_box(lua_State *L);
+static int sep_pause(lua_State *L);
+static int sep_play(lua_State *L);
+static int sep_say(lua_State *L);
+static int sep_banner(lua_State *L);
+static int sep_say_font(lua_State *L);
+static int sep_screenshot(lua_State *L);
+static int sep_search(lua_State *L);
+static int sep_search_blanking(lua_State *L);
+static int sep_set_disc_fps(lua_State *L);
+static int sep_skip_backward(lua_State *L);
+static int sep_skip_blanking(lua_State *L);
+static int sep_sound_load(lua_State *L);
+static int sep_sound_loadata(lua_State *L);
+static int sep_sound_unload(lua_State *L);
+static int sep_sound_play(lua_State *L);
+static int sep_sound_getvolume(lua_State *L);
+static int sep_sound_setvolume(lua_State *L);
+static int sep_sprite_draw(lua_State *L);
+static int sep_sprite_animate(lua_State *L);
+static int sep_sprite_grid(lua_State *L);
+static int sep_sprite_color_rekey(lua_State *L);
+static int sep_sprite_blend(lua_State *L);
+static int sep_sprite_frames(lua_State *L);
+static int sep_frame_width(lua_State *L);
+static int sep_sprite_height(lua_State *L);
+static int sep_sprite_load(lua_State *L);
+static int sep_sprite_loadframes(lua_State *L);
+static int sep_sprite_unload(lua_State *L);
+static int sep_sprite_width(lua_State *L);
+static int sep_skip_forward(lua_State *L);
+static int sep_skip_to_frame(lua_State *L);
+static int sep_step_backward(lua_State *L);
+static int sep_step_forward(lua_State *L);
+static int sep_stop(lua_State *L);
+// by RDG2010
+static int sep_keyboard_set_mode(lua_State *L);
+static int sep_keyboard_get_mode(lua_State *L);
+static int sep_keyboard_get_modifier(lua_State *L);
+static int sep_keyboard_get_down(lua_State *L);
+static int sep_keyboard_get_up(lua_State *L);
+static int sep_keyboard_is_down(lua_State *L);
+static int sep_keyboard_block_quit(lua_State *L);
+static int sep_controller_axis(lua_State *L);
+static int sep_controller_button(lua_State *L);
+static int sep_controller_valid(lua_State *L);
+static int sep_controller_setwad(lua_State *L);
+static int sep_controller_getwad(lua_State *L);
+static int sep_controller_attached(lua_State *L);
+static int sep_singe_quit(lua_State *L);
+static int sep_get_vldp_state(lua_State *L);
+static int sep_get_pause_flag(lua_State *L);
+static int sep_set_pause_flag(lua_State *L);
+static int sep_singe_version(lua_State *L);
+static int sep_ldp_verbose(lua_State *L);
+static int sep_sound_pause(lua_State *L);
+static int sep_sound_resume(lua_State *L);
+static int sep_sound_get_flag(lua_State *L);
+static int sep_sound_stop(lua_State *L);
+static int sep_sound_flush_queue(lua_State *L);
+// by DBX - Singe 2
+static int sep_music_load(lua_State *L);
+static int sep_music_play(lua_State *L);
+static int sep_music_playing(lua_State *L);
+static int sep_music_pause(lua_State *L);
+static int sep_music_resume(lua_State *L);
+static int sep_music_stop(lua_State *L);
+static int sep_music_volume(lua_State *L);
+static int sep_music_unload(lua_State *L);
+static int sep_sprite_rotate(lua_State *L);
+static int sep_sprite_scale(lua_State *L);
+static int sep_sprite_rotatescale(lua_State *L);
+static int sep_sprite_rotateframe(lua_State *L);
+static int sep_sprite_animate_rotated(lua_State *L);
+static int sep_sprite_quality(lua_State *L);
+static int sep_sprite_loadata(lua_State *L);
+static int sep_mpeg_set_rotate(lua_State *L);
+static int sep_mpeg_set_scale(lua_State *L);
+static int sep_set_gamename(lua_State *L);
+static int sep_singe_wants_crosshair(lua_State *L);
+static int sep_get_number_of_mice(lua_State *L);
+static int sep_get_number_of_realmice(lua_State *L);
+static int sep_get_mouse_position(lua_State *L);
+static int sep_get_mouse_padding(lua_State *L);
+static int sep_get_scriptpath(lua_State *L);
+static int sep_get_idstring(lua_State *L);
+static int sep_get_netperm(lua_State *L);
+static int sep_get_xratio(lua_State *L);
+static int sep_get_yratio(lua_State *L);
+static int sep_get_fvalue(lua_State *L);
+static int sep_doluafile(lua_State *L);
+static int sep_set_overlaysize(lua_State *L);
+static int sep_set_overlayfullalpha(lua_State *L);
+static int sep_set_overlayopacity(lua_State *L);
+static int sep_set_overlayontop(lua_State *L);
+static int sep_set_overlayscalemode(lua_State *L);
+static int sep_set_custom_overlay(lua_State *L);
+static int sep_controller_rumble(lua_State *L);
+static int sep_bezel_loaded(lua_State *L);
+static int sep_bezel_enable(lua_State *L);
+static int sep_bezel_clear(lua_State *L);
+static int sep_bezel_credits(lua_State *L);
+static int sep_bezel_second_score(lua_State *L);
+static int sep_bezel_player_score(lua_State *L);
+static int sep_bezel_player_lives(lua_State *L);
+static int sep_bezel_is_enabled(lua_State *L);
+static int sep_pseudo_audio_call(lua_State *L);
+static int sep_invalid_api_call(lua_State *L);
+static int sep_lua_rewrite(lua_State *L);
+static int sep_joymouse_enable(lua_State *L);
+static int sep_subtitle_load(lua_State *L);
+static int sep_subtitle_clear(lua_State *L);
+static int sep_subtitle_enable(lua_State *L);
+static int sep_subtitle_position(lua_State *L);
+static int sep_sprite_get_frame(lua_State *L);
+static int sep_sprite_playing(lua_State *L);
+static int sep_sprite_loop(lua_State *L);
+static int sep_sprite_pause(lua_State *L);
+static int sep_sprite_play(lua_State *L);
+static int sep_sprite_set_frame(lua_State *L);
