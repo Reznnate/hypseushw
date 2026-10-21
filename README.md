@@ -1,3 +1,6 @@
+<img width="427" height="240" alt="dlair1_480p" src="https://github.com/user-attachments/assets/98929b35-760a-4f82-b700-e4f0e8440e08" />
+<img width="427" height="240" alt="cliff1_480p" src="https://github.com/user-attachments/assets/02f3edb7-1daf-4abe-b1fb-ddd7fae4a4f7" />
+
 # Daphne (HypseusHW) libretro core
 
 A 64-bit libretro core, with sound, that plays the same data as `daphne.exe`.
