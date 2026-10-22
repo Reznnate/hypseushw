@@ -58,6 +58,12 @@ libretro-build-linux-x64:
     - .libretro-linux-cmake-x86_64
     - .core-defs
 
+# Linux 64-bit (ARM)
+libretro-build-linux-aarch64:
+  extends:
+    - .libretro-linux-cmake-aarch64
+    - .core-defs
+
 ################################### CELLULAR #################################
 # Android ARMv8
 android-arm64-v8a:
